@@ -719,7 +719,7 @@ document.addEventListener('DOMContentLoaded', function() {
             return;
         }
 
-        map = L.map('map', {
+        const-map = L.map('map', {
             contextmenu: true,
             contextmenuWidth: 140,
             contextmenuItems: [{
@@ -756,8 +756,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     fetchAndCacheStores(true); // Incremental load
                 }
             }]
-        }).setView([35.681236, 139.767125], 13); // Default view
-        logDebug('Map object created.');
+        });
 
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
@@ -767,26 +766,33 @@ document.addEventListener('DOMContentLoaded', function() {
         markers = L.featureGroup().addTo(map); // Initialize markers after map is defined
         logDebug('Marker feature group added.');
 
-        map.whenReady(function() {
-            logDebug('Map ready event fired.');
-            const cachedData = localStorage.getItem(CACHE_KEY);
-            if (cachedData) {
-                const { timestamp, data } = JSON.parse(cachedData);
-                const now = new Date().getTime();
-                if (now - timestamp < CACHE_EXPIRATION_TIME) {
-                    logDebug('Loading stores from cache.');
-                    data.forEach(store => allStores.set(store.map_store_id, store));
-                    renderStores(Array.from(allStores.values()));
-                    hideLoading();
-                    return; // Exit if we loaded from cache
-                } else {
-                    logDebug('Cached data expired.');
-                    localStorage.removeItem(CACHE_KEY);
-                }
-            }
-            // If no valid cache, fetch from network
-            fetchAndCacheStores(false);
-        });
+        if (navigator.geolocation) {
+            logDebug('Attempting to get current location for initial view...');
+            navigator.geolocation.getCurrentPosition(function(position) {
+                var lat = position.coords.latitude;
+                var lon = position.coords.longitude;
+                map.setView([lat, lon], 13);
+                logDebug(`Map centered on current location: Lat ${lat}, Lng ${lon}`);
+                map.whenReady(function() {
+                    logDebug('Map ready event fired.');
+                    fetchAndCacheStores(false);
+                });
+            }, function(error) {
+                logDebug(`Error getting location: ${error.message}. Falling back to default view.`);
+                map.setView([35.681236, 139.767125], 13); // Default view
+                map.whenReady(function() {
+                    logDebug('Map ready event fired.');
+                    fetchAndCacheStores(false);
+                });
+            });
+        } else {
+            logDebug('Geolocation is not supported by this browser. Using default view.');
+            map.setView([35.681236, 139.767125], 13); // Default view
+            map.whenReady(function() {
+                logDebug('Map ready event fired.');
+                fetchAndCacheStores(false);
+            });
+        }
     }
 
     // Event listener for filter button
