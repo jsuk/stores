@@ -1,0 +1,845 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Shop Map</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.3.4/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet-contextmenu/1.4.0/leaflet.contextmenu.min.css" />
+    <style>
+        html, body { height: 100%; margin: 0; padding: 0; }
+        #container { display: flex; height: 100vh; }
+        #map { flex: 3; height: 100%; min-height: 500px; }
+        #store-list { flex: 1; overflow-y: auto; padding: 10px; }
+        .store-item { cursor: pointer; padding: 5px; }
+        .store-item:hover { background-color: #f0f0f0; }
+        #debug-info { max-height: 150px; overflow-y: auto; border: 1px solid #ccc; padding: 5px; background-color: #f9f9f9; }
+        #loading-overlay {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(255, 255, 255, 0.8);
+            z-index: 10000;
+            display: none; /* Hidden by default */
+            justify-content: center;
+            align-items: center;
+        }
+        .loader {
+            border: 8px solid #f3f3f3; /* Light grey */
+            border-top: 8px solid #3498db; /* Blue */
+            border-radius: 50%;
+            width: 60px;
+            height: 60px;
+            animation: spin 1.5s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+<div id="js-status" style="padding: 10px; background-color: lightyellow; border: 1px solid orange;"></div>
+
+
+<div id="loading-overlay">
+    <div class="loader"></div>
+</div>
+
+<div id="debug-info">
+    <h3>Debug Information</h3>
+    <pre id="debug-output" style="white-space: pre-wrap;"></pre>
+</div>
+
+<div id="recent-clicks" style="border: 1px solid black; padding: 10px; margin-bottom: 10px;">
+    <h3>Recently Clicked Stores</h3>
+    <div id="clicked-store-1"></div>
+    <div id="clicked-store-2"></div>
+    <div id="distance-between-markers"></div>
+</div>
+
+<div style="margin-bottom: 10px;">
+    <label for="postalCodeFilter">Filter by Postal Code:</label>
+    <input type="text" id="postalCodeFilter" placeholder="Enter postal code">
+    <button id="applyFilter">Apply Filter</button>
+    <button id="clearFilter">Clear Filter</button>
+    <button id="useCurrentLocation">Use Current Location</button>
+</div>
+<div id="marker-count" style="margin-bottom: 10px;"></div>
+<div id="container">
+    <div id="map"></div>
+    <div id="store-list"></div>
+</div>
+
+
+
+<script src="https://unpkg.com/leaflet@1.3.4/dist/leaflet.js"></script>
+    
+    <script>
+        // This MUST be defined before other scripts try to use it.
+        function logDebug(message) {
+            const debugOutput = document.getElementById('debug-output');
+            console.log(message); // Also log to browser console
+            if (debugOutput) {
+                debugOutput.textContent += message + '\n';
+            } else {
+                // Fallback if the debug element isn't ready yet
+                console.log('Debug element not found, logging to console only:', message);
+            }
+        }
+    </script>
+    <script src="https://unpkg.com/topojson@3.0.2/dist/topojson.min.js"></script>
+    <script>logDebug('Topojson.js loaded.');</script>
+    <script src="https://unpkg.com/leaflet-topojson@0.3.0/dist/leaflet-topojson.min.js"></script>
+    <script>logDebug('Leaflet-Topojson.js loaded.');</script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet-contextmenu/1.4.0/leaflet.contextmenu.min.js"></script>
+    <script>logDebug('Leaflet-Contextmenu.js loaded.');</script>
+
+<script>
+document.addEventListener('DOMContentLoaded', function() {
+    logDebug('DOM fully loaded and parsed.');
+
+    var map;
+    var markers;
+
+    var allStores = new Map(); // Use a Map to store stores by ID, preventing duplicates
+    
+    var recentlyClickedStores = []; // To store recently clicked store names
+    var clickedStore1Div = document.getElementById('clicked-store-1');
+    var clickedStore2Div = document.getElementById('clicked-store-2');
+    var distanceBetweenMarkersDiv = document.getElementById('distance-between-markers');
+    var storeList = document.getElementById('store-list');
+    var postalCodeFilterInput = document.getElementById('postalCodeFilter');
+    var applyFilterButton = document.getElementById('applyFilter');
+    var clearFilterButton = document.getElementById('clearFilter');
+    var useCurrentLocationButton = document.getElementById('useCurrentLocation');
+    var markerCountDiv = document.getElementById('marker-count');
+    var apiUrl = 'http://localhost:8080/mmeu/api/v3/stores?client_id=integrated&longitude=139.641021&latitude=35.909794'; // Default API URL
+
+    const loadingOverlay = document.getElementById('loading-overlay');
+
+    function showLoading() {
+        if (loadingOverlay) loadingOverlay.style.display = 'flex';
+    }
+
+    function hideLoading() {
+        if (loadingOverlay) loadingOverlay.style.display = 'none';
+    }
+
+
+    // List of strings to filter out from store names
+    const EXCLUDE_STORE_NAMES_CONTAINING = [
+	"NPC24H", "NPC24H",
+	"ホワイト急便", "ﾎﾜｲﾄ急便",
+	"木曽路", "木曽路",
+	"和食処とんでん", "和食処とんでん",
+	"すき家", "ｽｷﾔ",
+	"松屋", "ﾏﾂﾔ",
+	"吉野家", "ﾖｼﾉﾔ",
+	"いちげん", "いちげん",
+	"BOOKOFF", "BOOKOFF",
+	"ニッポンレンタカー", "ﾆｯﾎﾟﾝﾚﾝﾀｶｰ",
+	"ビーンズ", "ﾋﾞｰﾝｽﾞ",
+	"AOKI", "AOKI",
+	"ユニクロ", "ﾕﾆｸﾛ",
+	"GU", "GU",
+	"無印良品", "ﾑｼﾞﾙｼﾘｮｳﾋﾝ",
+	"ニトリ", "ﾆﾄﾘ",
+	"ケーズデンキ", "ｹｰｽﾞﾃﾞﾝｷ",
+	"ヤマダ電機", "ﾔﾏﾀﾞﾃﾞﾝｷ",
+	"ビックカメラ", "ﾋﾞｯｸｶﾒﾗ",
+	"ヨドバシカメラ", "ﾖﾄﾞ\u0008ﾞｼｶﾒﾗ",
+	"エディオン", "エディオン",
+	"ジョーシン", "ｼﾞｮｰｼﾝ",
+	"コジマ", "ｺｼﾞﾏ",
+	"ソフマップ", "ｿﾌﾏｯﾌﾟ",
+	"ノジマ", "ﾉｼﾞﾏ",
+	"ウエルシア", "ｳｪﾙｼｱ",
+	"郵便局 ", "郵便局",
+	"ヤマト運輸", "ﾔﾏﾄ運輸",
+	"佐川急便", "ｻｶﾞﾜ急便",
+	"ホームセンターコーナン", "ﾎｰﾑｾﾝﾀｰｺｰﾅﾝ",
+	"ＨｏｎｄａＣａｒｓ", "Honda Cars",
+	"ドラッグセイムス", "ﾄﾞﾗｯｸﾞｾｲﾑｽ",
+	"ＮｅｗＤａｙｓ", "NewDays",
+	"ドラッグストアセキ", "ﾄﾞﾗｯｸﾞｽﾄｱｾｷ",
+	"ベルクス", "ﾍﾞﾙｸｽ",
+	"富士薬局", "富士薬局",
+	"やまや", "やまや",
+	"ヨークマート", "ﾖｰｸﾏｰﾄ",
+	"東横イン", "東横イン",
+	"幸楽苑", "幸楽苑",
+	"安楽亭", "安楽亭",
+	"タイムズ", "ﾀｲﾑｽﾞ",
+	"ビッグエコー", "ﾋﾞｯｸﾞｴｺｰ",
+	"餃子の王将", "餃子の王将",
+	"ジョリーパスタ", "ｼﾞｮﾘｰﾊﾟｽﾀ",
+	"大戸屋ごはん処", "大戸屋ごはん処",
+	"日高屋", "日高屋",
+	"スシロー", "ｽｼﾛｰ",
+	"くら寿司", "くら寿司",
+	"はま寿司", "はま寿司",
+	"かっぱ寿司", "かっぱ寿司",
+	"マクドナルド", "ﾏｸﾄﾞﾅﾙﾄﾞ",
+	"ケンタッキーフライドチキン", "ｹﾝﾀｯｷｰﾌﾗｲﾄﾞﾁｷﾝ",
+	"出光", "出光",
+	"牛角", "牛角",
+	"ガスト", "ｶﾞｽﾄ",
+	"ベルク", "ﾍﾞﾙｸ",
+	"丸亀製麺", "丸亀製麺",
+	"ほっともっと", "ﾎｯﾄﾓｯﾄ",
+	"ＥＮＥＯＳ", "ENEOS",
+	"Honda Dream", "Honda Dream",
+	"ロイヤルホスト", "ﾛｰﾔﾙﾎｽﾄ",
+	"セキ薬局", "ｾｷﾔｯｷｮｸ",
+        "閉店", // Closed
+        "セブンイレブン", "ｾﾌﾞﾝｲﾚﾌﾞﾝ",
+        "ファミリーマート", "ﾌｧﾐﾘｰﾏｰﾄ",
+        "ローソン", "ﾛｰｿﾝ",
+        "ミニストップ", "ﾐﾆｽﾄｯﾌﾟ",
+        "イオン", "イオン",
+        "イトーヨーカドー", "イトーヨーカドー",
+        "マクドナルド", "ﾏｸﾄﾞﾅﾙﾄﾞ",
+        "スターバックス", "ｽﾀｰﾊﾞｯｸｽ",
+        "ドトール", "ﾄﾞﾄｰﾙ",
+        "タリーズ", "ﾀﾘｰｽﾞ",
+        "モスバーガー", "ﾓｽﾊﾞｰｶﾞｰ",
+        "吉野家", "ﾖｼﾉﾔ",
+        "すき家", "ｽｷﾔ",
+        "松屋", "ﾏﾂﾔ",
+        "CoCo壱番屋", "CoCo壱番屋",
+        "ガスト", "ｶﾞｽﾄ",
+        "サイゼリヤ", "ｻｲｾﾞﾘﾔ",
+        "ドラッグエース＋調剤", "ﾄﾞﾗｯｸﾞｴｰｽ＋ﾁｮｳｻﾞｲ",
+        "ユニクロ", "ﾕﾆｸﾛ",
+        "GU", "GU",
+        "無印良品", "ﾑｼﾞﾙｼﾘｮｳﾋﾝ",
+        "ニトリ", "ﾆﾄﾘ",
+        "ケーズデンキ", "ｹｰｽﾞﾃﾞﾝｷ",
+        "ヤマダ電機", "ﾔﾏﾀﾞﾃﾞﾝｷ",
+        "ビックカメラ", "ﾋﾞｯｸｶﾒﾗ",
+        "ヨドバシカメラ", "ﾖﾄﾞ\u0008ﾞｼｶﾒﾗ",
+        "エディオン", "エディオン",
+        "ジョーシン", "ｼﾞｮｰｼﾝ",
+        "コジマ", "ｺｼﾞﾏ",
+        "ソフマップ", "ｿﾌﾏｯﾌﾟ",
+        "ノジマ", "ﾉｼﾞﾏ",
+        "ベスト電器", "ﾍﾞｽﾄﾃﾞﾝｷ",
+        "マクドナルド", "ﾏｸﾄﾞﾅﾙﾄﾞ",
+        "スターバックス", "ｽﾀｰﾊﾞｯｸｽ",
+        "ドトールコーヒー", "ﾄﾞﾄｰﾙｺｰﾋｰ",
+        "タリーズコーヒー", "ﾀﾘｰｽﾞｺｰﾋｰ",
+        "モスバーガー", "ﾓｽﾊﾞｰｶﾞｰ",
+        "ケンタッキーフライドチキン", "ｹﾝﾀｯｷｰﾌﾗｲﾄﾞﾁｷﾝ",
+        "サブウェイ", "ｻﾌﾞｳｪｲ",
+        "フレッシュネスバーガー", "ﾌﾚｯｼｭﾈｽﾊﾞｰｶﾞｰ",
+        "ロッテリア", "ﾛｯﾃﾘｱ",
+        "ファーストキッチン", "ﾌｧｰｽﾄｷｯﾁﾝ",
+        "吉野家", "ﾖｼﾉﾔ",
+        "すき家", "ｽｷﾔ",
+        "松屋", "ﾏﾂﾔ",
+        "なか卯", "ﾅｶｳ",
+        "CoCo壱番屋", "ココイチバンヤ",
+        "ガスト", "ｶﾞｽﾄ",
+        "サイゼリヤ", "ｻｲｾﾞﾘﾔ",
+        "デニーズ", "ﾃﾞﾆｰｽﾞ",
+        "ジョナサン", "ｼﾞｮﾅｻﾝ",
+        "バーミヤン", "ﾊﾞｰﾐﾔﾝ",
+        "夢庵", "ﾕﾒｱﾝ",
+        "ステーキガスト", "ｽﾃｰｷｶﾞｽﾄ",
+        "から好し", "ｶﾗﾖｼ",
+        "しゃぶ葉", "ｼｬﾌﾞﾖｳ",
+        "グラッチェガーデンズ", "ｸﾞﾗｯﾁｪｶﾞｰﾃﾞﾝｽﾞ",
+        "藍屋", "ｱｲﾔ",
+        "魚屋路", "ﾄﾄﾔﾐﾁ",
+        "むさしの森珈琲", "ﾑｻｼﾉﾓﾘｺｰﾋｰ",
+        "セリア", "ｾﾘｱ",
+        "ダイソー", "ﾀﾞｲｿｰ",
+        "キャンドゥ", "ｷｬﾝﾄﾞｩ",
+        "ワッツ", "ﾜｯﾂ",
+        "meets.", "meets.",
+        "シルク", "ｼﾙｸ",
+        "Can★Do", "Can★Do",
+        "Seria", "Seria",
+        "Daiso", "Daiso",
+        "Watts", "Watts",
+        "イオン", "イオン",
+        "イトーヨーカドー", "イトーヨーカドー",
+        "ライフ", "ﾗｲﾌ",
+        "西友", "ｾｲﾕｳ",
+        "マルエツ", "ﾏﾙｴﾂ",
+        "サミット", "ｻﾐｯﾄ",
+        "オーケー", "ｵｰｹｰ",
+        "成城石井", "ｾｲｼﾞｮｳｲｼｲ",
+        "紀ノ国屋", "ｷﾉｸﾆﾔ",
+        "クイーンズ伊勢丹", "ｸｲｰﾝｽﾞｲｾﾀﾝ",
+        "明治屋", "ﾒｲｼﾞﾔ",
+        "ピーコックストア", "ﾋﾟｰｺｯｸｽﾄｱ",
+        "東武ストア", "ﾄｳﾌﾞｽﾄｱ",
+        "京王ストア", "ｹｲｵｳｽﾄｱ",
+        "小田急OXストア", "ｵﾀﾞｷｭｳOXｽﾄｱ",
+        "東急ストア", "ﾄｳｷｭｳｽﾄｱ",
+        "Odakyu OX", "Odakyu OX",
+        "Tokyu Store", "Tokyu Store",
+        "Summit", "Summit",
+        "Maruetsu", "Maruetsu",
+        "Seiyu", "Seiyu",
+        "Life", "Life",
+        "Aeon", "Aeon",
+        "Ito-Yokado", "Ito-Yokado",
+        "OK Store", "OK Store",
+        "Seijo Ishii", "Seijo Ishii",
+        "Kinokuniya", "Kinokuniya",
+        "Queens Isetan", "Queens Isetan",
+        "Meidi-Ya", "Meidi-Ya",
+        "Peacock Store", "Peacock Store",
+        "Tobu Store", "Tobu Store",
+        "Keio Store", "Keio Store",
+        "ドン・キホーテ", "ﾄﾞﾝ･ｷﾎｰﾃ",
+        "ロフト", "ﾛﾌﾄ",
+        "東急ハンズ", "ﾄｳｷｭｳﾊﾝｽﾞ",
+        "PLAZA", "PLAZA",
+        "アインズ＆トルペ", "ｱｲﾝｽﾞｱﾝﾄﾞﾄﾙﾍﾟ",
+        "ショップイン", "ｼｮｯﾌﾟｲﾝ",
+        "アットコスメストア", "ｱｯﾄｺｽﾒｽﾄｱ",
+        "ハンズ", "ﾊﾝｽﾞ",
+        "ドンキ", "ﾄﾞﾝｷ",
+        "LOFT", "LOFT",
+        "Hands", "Hands",
+        "Plaza", "Plaza",
+        "Ainz & Tulpe", "Ainz & Tulpe",
+        "Shop In", "Shop In",
+        "@cosme store", "@cosme store",
+        "ドン・キホーテ", "ﾄﾞﾝ･ｷﾎｰﾃ",
+        "ロフト", "ﾛﾌﾄ",
+        "東急ハンズ", "ﾄｳｷｭｳﾊﾝｽﾞ",
+        "PLAZA", "PLAZA",
+        "アインズ＆トルペ", "ｱｲﾝｽﾞｱﾝﾄﾞﾄﾙﾍﾟ",
+        "ショップイン", "ｼｮｯﾌﾟｲﾝ",
+        "アットコスメストア", "ｱｯﾄｺｽﾒｽﾄｱ",
+        "ハンズ", "ﾊﾝｽﾞ",
+        "ドンキ", "ﾄﾞﾝｷ",
+        "LOFT", "LOFT",
+        "Hands", "Hands",
+        "Plaza", "Plaza",
+        "Ainz & Tulpe", "Ainz & Tulpe",
+        "Shop In", "Shop In",
+        "@cosme store", "@cosme store",
+        "ドン・キホーテ", "ﾄﾞﾝ･ｷﾎｰﾃ",
+        "ロフト", "ﾛﾌﾄ",
+        "東急ハンズ", "ﾄｳｷｭｳﾊﾝｽﾞ",
+        "PLAZA", "PLAZA",
+        "アインズ＆トルペ", "ｱｲﾝｽﾞｱﾝﾄﾞﾄﾙﾍﾟ",
+        "ショップイン", "ｼｮｯﾌﾟｲﾝ",
+        "アットコスメストア", "ｱｯﾄｺｽﾒｽﾄｱ",
+        "ハンズ", "ﾊﾝｽﾞ",
+        "ドンキ", "ﾄﾞﾝｷ",
+        "LOFT", "LOFT",
+        "Hands", "Hands",
+        "Plaza", "Plaza",
+        "Ainz & Tulpe", "Ainz & Tulpe",
+        "Shop In", "Shop In",
+        "@cosme store", "@cosme store",
+        "ツルハドラッグ", "ﾂﾙﾊﾄﾞﾗｯｸﾞ",
+        "マツモトキヨシ", "ﾏﾂﾓﾄｷﾖｼ",
+        "スギ薬局", "ｽｷﾞﾔｯｷｮｸ",
+        "サンドラッグ", "ｻﾝﾄﾞﾗｯｸﾞ",
+        "ウェルシア", "ｳｪﾙｼｱ",
+        "コスモス", "ｺｽﾓｽ",
+        "ディスカウントドラッグコスモス", "ﾃﾞｨｽｶｳﾝﾄﾄﾞﾗｯｸﾞｺｽﾓｽ",
+        "クリエイトエス・ディー", "ｸﾘｴｲﾄｴｽ･ﾃﾞｨｰ",
+        "ココカラファイン", "ｺｺｶﾗﾌｧｲﾝ",
+        "富士薬品", "ﾌｼﾞﾔｸﾋﾝ",
+        "クスリのアオキ", "ｸｽﾘﾉｱｵｷ",
+        "V・ドラッグ", "V･ﾄﾞﾗｯｸﾞ",
+        "キリン堂", "ｷﾘﾝﾄﾞｳ",
+        "ドラッグユタカ", "ﾄﾞﾗｯｸﾞﾕﾀｶ",
+        "ドラッグストアモリ", "ドラッグストアモリ",
+        "カワチ薬品", "ｶﾜﾁﾔｸﾋﾟﾝ",
+        "サツドラ", "ｻﾂﾄﾞﾗ",
+        "トモズ", "ﾄﾓｽﾞ",
+        "薬王堂", "ﾔｸｵｳﾄﾞｳ",
+        "杏林堂", "杏林堂",
+        "ゲンキー", "ｹﾞﾝｷｰ",
+        "ドラッグエース", "ﾄﾞﾗｯｸﾞｴｰｽ",
+        "セブン-イレブン", "ｾﾌﾞﾝ-ｲﾚﾌﾞﾝ",
+        "ファミリーマート", "ﾌｧﾐﾘｰﾏｰﾄ",
+        "ローソン", "ﾛｰｿﾝ",
+        "ミニストップ", "ﾐﾆｽﾄｯﾌﾟ",
+        "デイリーヤマザキ", "ﾃﾞｲﾘｰﾔﾏｻﾞｷ",
+        "セイコーマート", "ｾｲｺｰﾏｰﾄ",
+        "ポプラ", "ﾎﾟﾌﾟﾗ",
+        "NewDays", "NewDays",
+        "アズナス", "ｱｽﾞﾅｽ",
+        "生活彩家", "ｾｲｶﾂｻｲｶ",
+        "スリーエフ", "ｽﾘｰｴﾌ",
+        "コミュニティ・ストア", "ｺﾐｭﾆﾃｨ･ｽﾄｱ",
+        "セーブオン", "ｾｰﾌﾞｵﾝ",
+        "エブリワン", "エブリワン",
+        "ココストア", "ｺｺｽﾄｱ",
+        "サンクス", "ｻﾝｸｽ",
+        "am/pm", "am/pm",
+        "サークルK", "ｻｰｸﾙK",
+        "ホットスパー", "ﾎｯﾄｽﾊﾟｰ",
+        "Kマート", "Kﾏｰﾄ",
+        "RICマート", "RICﾏｰﾄ",
+        "ヤマザキショップ", "ﾔﾏｻﾞｷｼｮｯﾌﾟ",
+        "まいばすけっと", "ﾏｲﾊﾞｽｹｯﾄ",
+        "ローソンストア100", "ﾛｰｿﾝｽﾄｱ100",
+        "アンスリー", "ｱﾝｽﾘｰ",
+        "ベルマート", "ﾍﾞﾙﾏｰﾄ",
+        "ファミマ!!", "ﾌｧﾐﾏ!!",
+        "ナチュラルローソン", "ﾅﾁｭﾗﾙﾛｰｿﾝ",
+        "ローソン・スリーエフ", "ﾛｰｿﾝ･ｽﾘｰｴﾌ",
+        "ローソンポプラ", "ﾛｰｿﾝﾎﾟﾌﾟﾗ",
+        "ローソン＋スリーエフ", "ﾛｰｿﾝ＋ｽﾘｰｴﾌ",
+        "ローソン＋ポプラ", "ﾛｰｿﾝ＋ﾎﾟﾌﾟﾗ",
+        "ファミリーマート＋薬局", "ﾌｧﾐﾘｰﾏｰﾄ＋ﾔ\u0008ｷｮｸ",
+        "ファミリーマート＋ドラッグ", "ﾌｧﾐﾘｰﾏｰﾄ＋ﾄﾞﾗｯｸﾞ",
+        "セブン-イレブン＋薬局", "ｾﾌﾞﾝ-ｲﾚﾌﾞﾝ＋ﾔｯｷｮｸ",
+        "セブン-イレブン＋ドラッグ", "ｾﾌﾞﾝ-ｲﾚﾌﾞﾝ＋ﾄﾞﾗｯｸﾞ",
+        "ローソン＋薬局", "ﾛｰｿﾝ＋ﾔｯｷｮｸ",
+        "ローソン＋ドラッグ", "ﾛｰｿﾝ＋ﾄﾞﾗｯｸﾞ",
+        "ポプラ＋生活彩家", "ﾎﾟﾌﾟﾗ＋ｾｲｶﾂｻｲｶ",
+        "ミニストップ＋薬局", "ﾐﾆｽﾄｯﾌﾟ＋ﾔｯｷｮｸ",
+        "ミニストップ＋ドラッグ", "ﾐﾆｽﾄｯﾌﾟ＋ﾄﾞﾗｯｸﾞ",
+        "スギ薬局＋調剤", "ｽｷﾞﾔｯｷｮｸ＋ﾁｮｳｻﾞｲ",
+        "マツモトキヨシ＋調剤", "ﾏﾂﾓﾄｷﾖｼ＋ﾁｮｳｻﾞｲ",
+        "ツルハドラッグ＋調剤", "ﾂﾙﾊﾄﾞﾗｯｸﾞ＋ﾁｮｳｻﾞｲ",
+        "サンドラッグ＋調剤", "ｻﾝﾄﾞﾗｯｸﾞ＋ﾁｮｳｻﾞｲ",
+        "ウェルシア＋調剤", "ｳｪﾙｼｱ＋ﾁｮｳ\u0008ﾞｲ",
+        "コスモス＋調剤", "ｺｽﾓｽ＋ﾁｮｳｻﾞｲ",
+        "クリエイトエス・ディー＋調剤", "ｸﾘｴｲﾄｴｽ･ﾃﾞｨｰ＋ﾁｮｳｻﾞｲ",
+        "ココカラファイン＋調剤", "ｺｺｶﾗﾌｧｲﾝ＋ﾁｮｳｻﾞｲ",
+        "富士薬品＋調剤", "ﾌｼﾞﾔｸﾋﾟﾝ＋ﾁｮｳｻﾞｲ",
+        "クスリのアオキ＋調剤", "ｸｽﾘﾉｱｵｷ＋ﾁｮｳｻﾞｲ",
+        "V・ドラッグ＋調剤", "V･ﾄﾞﾗｯｸﾞ＋ﾁｮｳｻﾞｲ",
+        "キリン堂＋調剤", "ｷﾘﾝﾄﾞｳ＋ﾁｮｳｻﾞｲ",
+        "ドラッグユタカ＋調剤", "ﾄﾞﾗｯｸﾞﾕﾀｶ＋ﾁｮｳｻﾞｲ",
+        "ドラッグストアモリ＋調剤", "ドラッグストアモリ＋ﾁｮｳｻﾞｲ",
+        "カワチ薬品", "ｶﾜﾁﾔｸﾋﾟﾝ",
+        "サツドラ", "ｻﾂﾄﾞﾗ",
+        "トモズ", "ﾄﾓｽﾞ",
+        "薬王堂", "ﾔｸｵｳﾄﾞｳ",
+        "杏林堂＋調剤", "杏林堂＋ﾁｮｳｻﾞｲ",
+        "ゲンキー＋調剤", "ｹﾞﾝｷｰ＋\u0008ｮｳｻﾞｲ",
+        "ドラッグエース＋調剤", "ﾄﾞﾗｯｸﾞｴｰｽ＋ﾁｮｳｻﾞｲ"
+    ];
+
+    // Function to fetch and cache individual store detail (postal code)
+    const STORE_DETAIL_CACHE_KEY_PREFIX = 'store_detail_';
+    const STORE_DETAIL_CACHE_EXPIRATION_TIME = 24 * 60 * 60 * 1000; // 24 hours for individual store details
+
+    function fetchAndCacheStoreDetail(store) {
+        const individualStoreCacheKey = STORE_DETAIL_CACHE_KEY_PREFIX + store.map_store_id;
+        const cachedStoreDetail = localStorage.getItem(individualStoreCacheKey);
+
+        if (cachedStoreDetail) {
+            const { timestamp, data } = JSON.parse(cachedStoreDetail);
+            const now = new Date().getTime();
+
+            if (now - timestamp < STORE_DETAIL_CACHE_EXPIRATION_TIME) {
+                logDebug(`Using cached detail for store ${store.map_store_id}`);
+                Object.assign(store, data); // Merge all cached data
+                return Promise.resolve(store);
+            } else {
+                logDebug(`Cached detail for store ${store.map_store_id} expired.`);
+                localStorage.removeItem(individualStoreCacheKey); // Clear expired cache
+            }
+        }
+
+        const storeDetailUrl = `/mmeu/api/v3/store/${store.map_store_id}?client_id=integrated`;
+        return fetch(storeDetailUrl)
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`Failed to fetch details for store ${store.map_store_id}`);
+                }
+                return response.json();
+            })
+            .then(detailData => {
+                Object.assign(store, detailData); // Merge all fetched data
+                // Cache individual store detail
+                const cacheData = {
+                    timestamp: new Date().getTime(),
+                    data: detailData
+                };
+                localStorage.setItem(individualStoreCacheKey, JSON.stringify(cacheData));
+                logDebug(`Detail for store ${store.map_store_id} cached.`);
+                return store;
+            })
+            .catch(error => {
+                logDebug(`Error fetching detail for store ${store.map_store_id}: ${error}`);
+                console.error(`Error fetching detail for store ${store.map_store_id}:`, error);
+                return store; // Return original store even if detail fetch fails
+            });
+    }
+
+    // Simple hash function to generate a color from a string
+    function stringToColor(str) {
+        let hash = 0;
+        for (let i = 0; i < str.length; i++) {
+            hash = str.charCodeAt(i) + ((hash << 5) - hash);
+        }
+        let color = '#';
+        for (let i = 0; i < 3; i++) {
+            let value = (hash >> (i * 8)) & 0xFF;
+            color += ('00' + value.toString(16)).substr(-2);
+        }
+        return color;
+    }
+
+    function updateRecentlyClicked(storeName, lat, lon) {
+        // Add the new store to the beginning of the array
+        recentlyClickedStores.unshift({ name: storeName, lat: lat, lon: lon });
+        // Keep only the two most recent
+        if (recentlyClickedStores.length > 2) {
+            recentlyClickedStores.pop();
+        }
+        // Update the display
+        clickedStore1Div.textContent = recentlyClickedStores[0] ? `1. ${recentlyClickedStores[0].name}` : '';
+        clickedStore2Div.textContent = recentlyClickedStores[1] ? `2. ${recentlyClickedStores[1].name}` : '';
+
+        // Calculate and display distance if two markers are clicked
+        if (recentlyClickedStores.length === 2) {
+            var latlng1 = L.latLng(recentlyClickedStores[0].lat, recentlyClickedStores[0].lon);
+            var latlng2 = L.latLng(recentlyClickedStores[1].lat, recentlyClickedStores[1].lon);
+            var distance = latlng1.distanceTo(latlng2); // Distance in meters
+            distanceBetweenMarkersDiv.textContent = `Distance: ${ (distance / 1000).toFixed(2) } km`;
+        } else {
+            distanceBetweenMarkersDiv.textContent = '';
+        }
+    }
+
+    
+
+    // Function to render stores on the map and list
+    function renderStores(storesToRender, visitingOrder = null) {
+        storeList.innerHTML = ''; // Clear existing list
+        markers.clearLayers(); // Clear existing markers
+
+        if (storesToRender && Array.isArray(storesToRender)) {
+            // Apply exclusion filter
+            storesToRender = storesToRender.filter(store => {
+                const storeName = store.store_name || '';
+                return !EXCLUDE_STORE_NAMES_CONTAINING.some(excludedString => storeName.includes(excludedString));
+            });
+
+            var storeCount = storesToRender.length;
+            markerCountDiv.textContent = `Markers on map: ${storeCount}`;
+
+            const orderMap = new Map();
+            if (visitingOrder) {
+                visitingOrder.forEach((storeId, index) => {
+                    orderMap.set(storeId, index + 1); // Store 1-based order
+                });
+            }
+
+            storesToRender.forEach(function(store) {
+                if (store.latitude && store.longitude) {
+                    var markerColor = stringToColor(store.postal_code || 'default');
+
+                    let markerHtml = `<div style="background-color: ${markerColor}; width: 20px; height: 20px; border-radius: 50%; border: 2px solid white; display: flex; justify-content: center; align-items: center; color: black; font-weight: bold;">`;
+                    if (orderMap.has(store.map_store_id)) {
+                        markerHtml += `<span>${orderMap.get(store.map_store_id)}</span>`;
+                    }
+                    markerHtml += `</div>`;
+
+                    var customIcon = L.divIcon({
+                        className: 'custom-marker',
+                        html: markerHtml,
+                        iconSize: [24, 24],
+                        iconAnchor: [12, 12],
+                        popupAnchor: [0, -12]
+                    });
+
+                    var marker = L.marker([store.latitude, store.longitude], { icon: customIcon })
+                        .bindPopup(`${store.store_name} (Postal Code: ${store.postal_code || 'N/A'})`)
+                        .addTo(markers);
+
+                    marker.on('click', (function(storeName, lat, lon) {
+                        return function() {
+                            updateRecentlyClicked(storeName, lat, lon);
+                        };
+                    })(store.store_name, store.latitude, store.longitude));
+
+                    var storeItem = document.createElement('div');
+                    storeItem.className = 'store-item';
+                    storeItem.textContent = store.postal_code + ' ' + store.store_name;
+                    var postalCodeSpan = document.createElement('span');
+                    postalCodeSpan.className = 'postal-code-filter';
+                    postalCodeSpan.textContent = store.postal_code;
+                    postalCodeSpan.style.cursor = 'pointer';
+                    postalCodeSpan.style.textDecoration = 'underline';
+                    postalCodeSpan.onclick = (function(code) {
+                        return function(event) {
+                            event.stopPropagation(); // Prevent storeItem click from firing
+                            postalCodeFilterInput.value = code;
+                            applyFilterButton.click();
+                        };
+                    })(store.postal_code);
+
+                    storeItem.innerHTML = ''; // Clear existing text
+                    storeItem.appendChild(postalCodeSpan);
+                    storeItem.appendChild(document.createTextNode(' ' + store.store_name));
+                    storeItem.onclick = (function(store, m) {
+                        return function() {
+                            map.setView([store.latitude, store.longitude], 15);
+                            m.openPopup();
+                            updateRecentlyClicked(store.store_name, store.latitude, store.longitude);
+
+                            if (!store.postal_code) {
+                                fetchAndCacheStoreDetail(store)
+                                    .then(updatedStore => {
+                                        // Find the updated store in allStores and replace it
+                                        const index = Array.from(allStores.values()).findIndex(s => s.map_store_id === updatedStore.map_store_id);
+                                        if (index !== -1) {
+                                            allStores.set(updatedStore.map_store_id, updatedStore);
+                                            renderStores(Array.from(allStores.values())); // Re-render to update marker color and list item
+                                        }
+                                    })
+                                    .catch(error => {
+                                        console.error(`Error fetching detail for store ${store.map_store_id}:`, error);
+                                    });
+                            }
+                        };
+                    })(store, marker);
+                    storeList.appendChild(storeItem);
+                }
+            });
+        } else {
+        }
+    }
+
+    // Initial data fetch with caching
+    const CACHE_KEY = 'stores_data';
+    const CACHE_EXPIRATION_TIME = 60 * 60 * 1000; // 1 hour in milliseconds
+
+    function fetchAndCacheStores(isIncremental = false) {
+        logDebug('Attempting to fetch and cache stores...');
+        showLoading();
+        fetch(apiUrl)
+            .then(response => {
+                logDebug(`API response status: ${response.status}`);
+                if (!response.ok) {
+                    throw new Error(`Network response was not ok: ${response.statusText}`);
+                }
+                return response.json();
+            })
+            .then(data => {
+                logDebug(`API data received. Store count: ${data.stores ? data.stores.length : 0}`);
+                if (data.stores && Array.isArray(data.stores)) {
+                    let newStores = [];
+                    if (isIncremental) {
+                        data.stores.forEach(store => {
+                            if (!allStores.has(store.map_store_id)) {
+                                allStores.set(store.map_store_id, store);
+                                newStores.push(store);
+                            }
+                        });
+                        logDebug(`Found ${newStores.length} new stores to add.`);
+                    } else {
+                        allStores.clear();
+                        data.stores.forEach(store => allStores.set(store.map_store_id, store));
+                        newStores = data.stores;
+                        logDebug('Reloading all stores.');
+                    }
+
+                    const storesToProcess = newStores.length > 0 ? newStores : Array.from(allStores.values());
+
+                    const fetchPostalCodes = storesToProcess.map(store => fetchAndCacheStoreDetail(store));
+
+                    Promise.all(fetchPostalCodes)
+                        .then((processedStores) => {
+                            logDebug('All details fetched. Rendering stores...');
+                            
+                            // Update the main cache with all stores
+                            const cacheData = {
+                                timestamp: new Date().getTime(),
+                                data: Array.from(allStores.values()) // Convert Map to array for JSON
+                            };
+                            localStorage.setItem(CACHE_KEY, JSON.stringify(cacheData));
+                            logDebug('Main store cache updated.');
+
+                            if (map) {
+                                try {
+                                    renderStores(Array.from(allStores.values()));
+                                } catch (renderError) {
+                                    logDebug(`Error during renderStores: ${renderError}`);
+                                    console.error('Error during renderStores:', renderError);
+                                }
+                            }
+                        })
+                        .catch(error => {
+                            logDebug(`Error in Promise.all for postal codes: ${error}`);
+                            console.error(`Error in Promise.all for postal codes:`, error);
+                            if (map) {
+                                renderStores(Array.from(allStores.values()));
+                            }
+                        })
+                        .finally(() => {
+                            hideLoading();
+                        });
+
+                } else {
+                    logDebug('API response did not contain a valid "stores" array.');
+                    hideLoading();
+                }
+            })
+            .catch(error => {
+                logDebug(`Error fetching from API: ${error}`);
+                console.error('Error:', error);
+                hideLoading();
+            });
+    }
+
+    function forceReloadAllStores() {
+        logDebug('Forcing reload of all store data...');
+        allStores.clear();
+        // Clear all individual store detail caches
+        Object.keys(localStorage).forEach(key => {
+            if (key.startsWith(STORE_DETAIL_CACHE_KEY_PREFIX)) {
+                localStorage.removeItem(key);
+            }
+        });
+        logDebug('All individual store detail caches cleared.');
+
+        // Re-fetch everything
+        fetchAndCacheStores(false);
+    }
+
+    function initializeMapWithLocation() {
+        logDebug('Initializing map...');
+        const mapElement = document.getElementById('map');
+        if (mapElement) {
+            logDebug(`Map container dimensions: ${mapElement.offsetWidth}x${mapElement.offsetHeight}`);
+        } else {
+            logDebug('Map container #map not found!');
+            return;
+        }
+
+        map = L.map('map', {
+            contextmenu: true,
+            contextmenuWidth: 140,
+            contextmenuItems: [{
+                text: 'Center map here',
+                callback: (e) => {
+                    map.panTo(e.latlng);
+                }
+            }, {
+                text: 'Zoom in',
+                callback: () => {
+                    map.zoomIn();
+                }
+            }, {
+                text: 'Zoom out',
+                callback: () => {
+                    map.zoomOut();
+                }
+            }, {
+                text: 'Reload Stores',
+                callback: () => {
+                    fetchAndCacheStores(false);
+                }
+            }, {
+                text: 'Force Reload All Store Data',
+                callback: () => {
+                    forceReloadAllStores();
+                }
+            }, {
+                text: 'Fetch stores from this location',
+                callback: (e) => {
+                    const { lat, lng } = e.latlng;
+                    logDebug(`Fetching stores for new location: Lat ${lat}, Lng ${lng}`);
+                    apiUrl = `http://localhost:8080/mmeu/api/v3/stores?client_id=integrated&longitude=${lng}&latitude=${lat}`;
+                    fetchAndCacheStores(true); // Incremental load
+                }
+            }]
+        }).setView([35.681236, 139.767125], 13); // Default view
+        logDebug('Map object created.');
+
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+        }).addTo(map);
+        logDebug('Tile layer added.');
+
+        markers = L.featureGroup().addTo(map); // Initialize markers after map is defined
+        logDebug('Marker feature group added.');
+
+        map.whenReady(function() {
+            logDebug('Map ready event fired.');
+            const cachedData = localStorage.getItem(CACHE_KEY);
+            if (cachedData) {
+                const { timestamp, data } = JSON.parse(cachedData);
+                const now = new Date().getTime();
+                if (now - timestamp < CACHE_EXPIRATION_TIME) {
+                    logDebug('Loading stores from cache.');
+                    data.forEach(store => allStores.set(store.map_store_id, store));
+                    renderStores(Array.from(allStores.values()));
+                    hideLoading();
+                    return; // Exit if we loaded from cache
+                } else {
+                    logDebug('Cached data expired.');
+                    localStorage.removeItem(CACHE_KEY);
+                }
+            }
+            // If no valid cache, fetch from network
+            fetchAndCacheStores(false);
+        });
+    }
+
+    // Event listener for filter button
+    applyFilterButton.addEventListener('click', function() {
+        var filterPostalCode = postalCodeFilterInput.value.trim();
+        if (filterPostalCode) {
+            var filteredStores = Array.from(allStores.values()).filter(store => store.postal_code === filterPostalCode);
+            renderStores(filteredStores);
+            logDebug('Filtered by postal code: ' + filterPostalCode + '. Found ' + filteredStores.length + ' stores.');
+        } else {
+            renderStores(Array.from(allStores.values())); // If filter is empty, show all stores
+            logDebug('Postal code filter cleared. Showing all stores.');
+        }
+    });
+
+    // Event listener for clear filter button
+    clearFilterButton.addEventListener('click', function() {
+        postalCodeFilterInput.value = ''; // Clear the input field
+        renderStores(Array.from(allStores.values())); // Render all stores
+        logDebug('Filter cleared. Showing all stores.');
+    });
+
+    // Event listener for "Use Current Location" button
+    useCurrentLocationButton.addEventListener('click', function() {
+        if (navigator.geolocation) {
+            logDebug('Attempting to get current location...');
+            showLoading();
+            navigator.geolocation.getCurrentPosition(function(position) {
+                var lat = position.coords.latitude;
+                var lon = position.coords.longitude;
+                logDebug(`Current location: Latitude ${lat}, Longitude ${lon}`);
+                apiUrl = `http://localhost:8080/mmeu/api/v3/stores?client_id=integrated&longitude=${lon}&latitude=${lat}`;
+                logDebug(`Updated API URL for current location: ${apiUrl}`);
+                fetchAndCacheStores(true); // Incremental load
+            }, function(error) {
+                logDebug(`Error getting location: ${error.message}`);
+                console.error('Error getting location:', error);
+                alert('Could not get your current location. Please ensure location services are enabled and you have granted permission.');
+                hideLoading();
+            });
+        } else {
+            logDebug('Geolocation is not supported by this browser.');
+            alert('Geolocation is not supported by your browser.');
+        }
+    });
+
+    // Initialize map and fetch stores
+    var jsStatusDiv = document.getElementById('js-status');
+    if (jsStatusDiv) {
+        jsStatusDiv.textContent = 'JavaScript is running!';
+    }
+    initializeMapWithLocation();
+});
+</script>
+</body>
+</html>
