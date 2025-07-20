@@ -247,6 +247,7 @@ document.addEventListener('DOMContentLoaded', function() {
         "デニーズ", "ﾃﾞﾆｰｽﾞ",
         "ジョナサン", "ｼﾞｮﾅｻﾝ",
         "バーミヤン", "ﾊﾞｰﾐﾔﾝ",
+	"焼鳥日高", "ﾔｷﾄﾘﾋﾀﾞｶ",
         "夢庵", "ﾕﾒｱﾝ",
         "ステーキガスト", "ｽﾃｰｷｶﾞｽﾄ",
         "から好し", "ｶﾗﾖｼ",
@@ -554,9 +555,28 @@ document.addEventListener('DOMContentLoaded', function() {
                         popupAnchor: [0, -12]
                     });
 
-                    var marker = L.marker([store.latitude, store.longitude], { icon: customIcon })
-                        .bindPopup(`${store.store_name} (Postal Code: ${store.postal_code || 'N/A'})`)
-                        .addTo(markers);
+                    var marker = L.marker([store.latitude, store.longitude], { icon: customIcon });
+
+                    var popupContent = document.createElement('div');
+                    popupContent.appendChild(document.createTextNode(store.store_name + ' (Postal Code: '));
+                    
+                    var postalCodeLink = document.createElement('a');
+                    postalCodeLink.href = '#';
+                    postalCodeLink.textContent = store.postal_code || 'N/A';
+                    postalCodeLink.style.cursor = 'pointer';
+                    postalCodeLink.style.textDecoration = 'underline';
+                    postalCodeLink.onclick = function(e) {
+                        e.preventDefault();
+                        if (store.postal_code) {
+                            postalCodeFilterInput.value = store.postal_code;
+                            applyFilterButton.click();
+                        }
+                    };
+                    popupContent.appendChild(postalCodeLink);
+                    popupContent.appendChild(document.createTextNode(')'));
+
+                    marker.bindPopup(popupContent);
+                    marker.addTo(markers);
 
                     marker.on('click', (function(storeName, lat, lon) {
                         return function() {
@@ -766,54 +786,64 @@ document.addEventListener('DOMContentLoaded', function() {
         markers = L.featureGroup().addTo(map); // Initialize markers after map is defined
         logDebug('Marker feature group added.');
 
-        // Add the new TopoJSON layer and fit map to its bounds
-        fetch('https://geoshape.ex.nii.ac.jp/ka/topojson/2020/11/r2ka11224.topojson')
-            .then(response => {
-                if (!response.ok) {
-                    throw new Error(`HTTP error! status: ${response.status}`);
-                }
-                return response.json();
-            })
-            .then(data => {
-                logDebug('TopoJSON data fetched successfully.');
-                
-                // It's good practice to check if the object key exists
-                const objectKey = Object.keys(data.objects)[0];
-                if (!objectKey) {
-                    throw new Error('No objects found in TopoJSON data.');
-                }
-                logDebug(`Found TopoJSON object key: ${objectKey}`);
-
-                // Convert TopoJSON to GeoJSON
-                const geojsonData = topojson.feature(data, data.objects[objectKey]);
-                logDebug('Successfully converted TopoJSON to GeoJSON.');
-
-                const geoJsonLayer = L.geoJSON(geojsonData, {
-                    style: function(feature) {
-                        return {
-                            color: 'green', // Changed color for visibility
-                            weight: 3,
-                            opacity: 0.8
-                        };
+        // Function to add a TopoJSON layer from a URL
+        function addTopoJsonLayer(url, color) {
+            fetch(url)
+                .then(response => {
+                    if (!response.ok) {
+                        throw new Error(`HTTP error! status: ${response.status}`);
                     }
-                });
-                
-                geoJsonLayer.addTo(map);
-                logDebug('GeoJSON layer added to the map.');
+                    return response.json();
+                })
+                .then(data => {
+                    logDebug(`TopoJSON data fetched successfully from ${url}.`);
+                    
+                    const objectKey = Object.keys(data.objects)[0];
+                    if (!objectKey) {
+                        throw new Error('No objects found in TopoJSON data.');
+                    }
+                    logDebug(`Found TopoJSON object key: ${objectKey}`);
 
-                // Fit the map view to the bounds of the new layer
-                const bounds = geoJsonLayer.getBounds();
-                if (bounds.isValid()) {
-                    map.fitBounds(bounds);
-                    logDebug('Map view fitted to GeoJSON layer bounds.');
-                } else {
-                    logDebug('Could not get valid bounds from GeoJSON layer.');
-                }
-            })
-            .catch(error => {
-                logDebug('Error loading or processing TopoJSON/GeoJSON layer: ' + error);
-                console.error('Error with TopoJSON/GeoJSON layer:', error);
-            });
+                    const geojsonData = topojson.feature(data, data.objects[objectKey]);
+                    logDebug('Successfully converted TopoJSON to GeoJSON.');
+
+                    const geoJsonLayer = L.geoJSON(geojsonData, {
+                        style: function(feature) {
+                            return {
+                                color: color,
+                                weight: 3,
+                                opacity: 0.8
+                            };
+                        }
+                    });
+                    
+                    geoJsonLayer.addTo(map);
+                    logDebug('GeoJSON layer added to the map.');
+
+                    const bounds = geoJsonLayer.getBounds();
+                    if (bounds.isValid()) {
+                        // Extend map bounds to include this layer
+                        const mapBounds = map.getBounds();
+                        if (mapBounds.isValid()) {
+                            map.fitBounds(mapBounds.extend(bounds));
+                        } else {
+                            map.fitBounds(bounds);
+                        }
+                        logDebug('Map view fitted to include GeoJSON layer bounds.');
+                    } else {
+                        logDebug('Could not get valid bounds from GeoJSON layer.');
+                    }
+                })
+                .catch(error => {
+                    logDebug(`Error loading or processing TopoJSON/GeoJSON layer from ${url}: ${error}`);
+                    console.error(`Error with TopoJSON/GeoJSON layer from ${url}:`, error);
+                });
+        }
+
+        // Add the TopoJSON layers
+        addTopoJsonLayer('https://geoshape.ex.nii.ac.jp/ka/topojson/2020/11/r2ka11224.topojson', 'green');
+        addTopoJsonLayer('https://geoshape.ex.nii.ac.jp/ka/topojson/2020/13/r2ka13117.topojson', 'purple');
+        addTopoJsonLayer('https://geoshape.ex.nii.ac.jp/ka/topojson/2020/11/r2ka11223.topojson', 'blue');
 
         if (navigator.geolocation) {
             logDebug('Attempting to get current location for initial view...');
