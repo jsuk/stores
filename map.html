@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>TopoJSON with Different Colors</title>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <style>
+        #map { height: 100vh; }
+    </style>
+</head>
+<body>
+
+<div id="map"></div>
+
+<script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+<script src="https://unpkg.com/topojson-client@3"></script>
+
+<script>
+    // 1. Create the map
+    var map = L.map('map').setView([35.36, 139.45], 10); // Centered roughly on the Kanagawa area
+
+    // 2. Add OpenStreetMap tile layer
+    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+    }).addTo(map);
+
+    // 3. Function to generate a random color
+    function getRandomColor() {
+        var letters = '0123456789ABCDEF';
+        var color = '#';
+        for (var i = 0; i < 6; i++) {
+            color += letters[Math.floor(Math.random() * 16)];
+        }
+        return color;
+    }
+
+    // 4. Define the styling for each feature
+    function styleFeature(feature) {
+        return {
+            color: getRandomColor(),
+            weight: 2,
+            opacity: 1,
+            fillOpacity: 0.7
+        };
+    }
+    
+    // 5. Function to add popups
+    function onEachFeature(feature, layer) {
+        var properties = feature.properties;
+        if (properties) {
+            var popupContent = "<h4>Properties</h4><ul>";
+            for (var key in properties) {
+                popupContent += "<li><strong>" + key + ":</strong> " + properties[key] + "</li>";
+            }
+            popupContent += "</ul>";
+            layer.bindPopup(popupContent);
+        }
+    }
+
+    // 6. Fetch and process the TopoJSON data
+    var url = "https://geoshape.ex.nii.ac.jp/ka/topojson/2020/11/r2ka11224.topojson";
+    
+    fetch(url)
+        .then(response => response.json())
+        .then(topojsonData => {
+            // Find the correct object key in the TopoJSON file
+            var geojsonCollection;
+            if (topojsonData.objects.r2ka11224) {
+                geojsonCollection = topojson.feature(topojsonData, topojsonData.objects.r2ka11224);
+            } else {
+                // Fallback if the object name is different
+                var key = Object.keys(topojsonData.objects)[0];
+                geojsonCollection = topojson.feature(topojsonData, topojsonData.objects[key]);
+            }
+
+            // Create the GeoJSON layer
+            var geojsonLayer = L.geoJSON(geojsonCollection, {
+                style: styleFeature,
+                onEachFeature: onEachFeature
+            }).addTo(map);
+
+            // Fit map bounds to the data
+            map.fitBounds(geojsonLayer.getBounds());
+        })
+        .catch(error => console.error('Error loading TopoJSON data:', error));
+
+</script>
+
+</body>
+</html>
