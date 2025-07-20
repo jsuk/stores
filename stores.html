@@ -61,6 +61,10 @@
     </div>
     <div id="postal-code-container">
         <h3>Unique Postal Codes on Map</h3>
+        <div id="start-store-selector-container" style="display: none; margin-bottom: 10px;">
+            <label for="startStoreSelector">Select Starting Store:</label>
+            <select id="startStoreSelector"></select>
+        </div>
         <ul id="postal-code-list"></ul>
         <div id="tsp-distance-container" style="margin-top: 10px;"></div>
     </div>
@@ -149,7 +153,13 @@
         return transaction.complete;
     }
 
+    let postalCodeAddressCache = null;
+
     async function getDataFromDB() {
+        if (postalCodeAddressCache) {
+            logDebug('Using in-memory postal code address cache.');
+            return postalCodeAddressCache;
+        }
         const db = await openDB();
         const transaction = db.transaction(storeName, 'readonly');
         const store = transaction.objectStore(storeName);
@@ -163,6 +173,7 @@
         allRecords.forEach(record => {
             postalData[record.postalCode] = record.data;
         });
+        postalCodeAddressCache = postalData;
         return postalData;
     }
 
@@ -778,11 +789,22 @@ document.addEventListener('DOMContentLoaded', function() {
                     marker.bindPopup(popupContent);
                     marker.addTo(markers);
 
-                    marker.on('click', (function(storeName, lat, lon) {
+                    marker.on('click', (function(store) {
                         return function() {
-                            updateRecentlyClicked(storeName, lat, lon);
+                            updateRecentlyClicked(store.store_name, store.latitude, store.longitude);
+                            
+                            const postalCode = postalCodeFilterInput.value.trim();
+                            if (postalCode && postalCode === store.postal_code) {
+                                const filteredStores = Array.from(allStores.values()).filter(s => s.postal_code === postalCode);
+                                const storeIndex = filteredStores.findIndex(s => s.map_store_id === store.map_store_id);
+                                if (storeIndex !== -1) {
+                                    const startStoreSelector = document.getElementById('startStoreSelector');
+                                    startStoreSelector.value = storeIndex;
+                                    applyPostalFilter(postalCode);
+                                }
+                            }
                         };
-                    })(store.store_name, store.latitude, store.longitude));
+                    })(store));
 
                     var storeItem = document.createElement('div');
                     storeItem.className = 'store-item';
@@ -899,8 +921,10 @@ document.addEventListener('DOMContentLoaded', function() {
             const uniquePostalCodes = [...new Set(stores.map(store => store.postal_code).filter(Boolean))];
             uniquePostalCodes.sort();
 
+            const allPostalData = await getDataFromDB(); // Fetch all data once
+
             for (const code of uniquePostalCodes) {
-                const postalInfo = await getPostalData(code);
+                const postalInfo = allPostalData[code] || null;
                 let addressString = '';
                 if (postalInfo && postalInfo.length > 0) {
                     const firstEntry = postalInfo[0];
@@ -1248,6 +1272,13 @@ document.addEventListener('DOMContentLoaded', function() {
   <Document>
     <name>TSP Route for ${postalCode}</name>
     <description>Optimal route for visiting stores in postal code ${postalCode}.</description>
+    <Style id="startPlacemark">
+      <IconStyle>
+        <Icon>
+          <href>http://maps.google.com/mapfiles/kml/pins/red-dot.png</href>
+        </Icon>
+      </IconStyle>
+    </Style>
     <Style id="lineStyle">
       <LineStyle>
         <color>7f0000ff</color>
@@ -1260,6 +1291,7 @@ document.addEventListener('DOMContentLoaded', function() {
     <Placemark>
       <name>${index + 1}. ${store.store_name}</name>
       <description>Postal Code: ${store.postal_code}</description>
+      ${index === 0 ? '<styleUrl>#startPlacemark</styleUrl>' : ''}
       <Point>
         <coordinates>${store.longitude},${store.latitude},0</coordinates>
       </Point>
@@ -1314,11 +1346,35 @@ document.addEventListener('DOMContentLoaded', function() {
             tspDistanceContainer.innerHTML = '';
         }
 
+        const startStoreSelectorContainer = document.getElementById('start-store-selector-container');
+        const startStoreSelector = document.getElementById('startStoreSelector');
+
         if (postalCode) {
-            var filteredStores = Array.from(allStores.values()).filter(store => store.postal_code === postalCode);
-            logDebug('Filtered by postal code: ' + postalCode + '. Found ' + filteredStores.length + ' stores.');
+            let filteredStores = Array.from(allStores.values()).filter(store => store.postal_code === postalCode);
+            
+            // Apply the same name exclusion filter as used in renderStores
+            filteredStores = filteredStores.filter(store => {
+                const storeName = store.store_name || '';
+                return !EXCLUDE_STORE_NAMES_CONTAINING.some(excludedString => storeName.includes(excludedString));
+            });
+
+            logDebug('Filtered by postal code and name exclusions: ' + postalCode + '. Found ' + filteredStores.length + ' stores.');
 
             if (filteredStores.length > 1) {
+                // Populate start store selector
+                startStoreSelector.innerHTML = ''; // Clear previous options
+                const savedSelection = localStorage.getItem('startStore-' + postalCode);
+                filteredStores.forEach((store, index) => {
+                    const option = document.createElement('option');
+                    option.value = index;
+                    option.textContent = store.store_name;
+                    if (savedSelection !== null && index == parseInt(savedSelection, 10)) {
+                        option.selected = true;
+                    }
+                    startStoreSelector.appendChild(option);
+                });
+                startStoreSelectorContainer.style.display = 'block';
+
                 logDebug('Creating distance matrix...');
                 const distanceMatrix = [];
                 for (let i = 0; i < filteredStores.length; i++) {
@@ -1348,14 +1404,14 @@ document.addEventListener('DOMContentLoaded', function() {
                     }
 
                     // 2-opt TSP solver
-                    function twoOptTsp(distanceMatrix) {
+                    function twoOptTsp(distanceMatrix, startIndex = 0) {
                         const n = distanceMatrix.length;
                         if (n === 0) return [];
 
-                        // Initial tour using nearest neighbor
+                        // Initial tour using nearest neighbor starting from startIndex
                         let tour = [];
                         let unvisited = new Set(Array.from({ length: n }, (_, i) => i));
-                        let currentCity = 0;
+                        let currentCity = startIndex;
                         tour.push(currentCity);
                         unvisited.delete(currentCity);
 
@@ -1383,19 +1439,16 @@ document.addEventListener('DOMContentLoaded', function() {
                         const maxIterations = 1000; // Safety break
                         while (improved && iteration < maxIterations) {
                             improved = false;
-                            for (let i = 1; i < n - 2; i++) {
-                                for (let j = i + 1; j < n - 1; j++) {
-                                    // Current tour edges: (i-1, i) and (j, j+1)
-                                    // Proposed new edges: (i-1, j) and (i, j+1)
-                                    const currentDistance = distanceMatrix[tour[i - 1]][tour[i]] + distanceMatrix[tour[j]][tour[j + 1]];
-                                    const newDistance = distanceMatrix[tour[i - 1]][tour[j]] + distanceMatrix[tour[i]][tour[j + 1]];
+                            for (let i = 1; i < n - 1; i++) { // Start from 1 to keep start node fixed
+                                for (let j = i + 1; j < n; j++) {
+                                    const newTour = [...tour];
+                                    const segment = newTour.slice(i, j + 1).reverse();
+                                    for(let k = 0; k < segment.length; k++) {
+                                        newTour[i + k] = segment[k];
+                                    }
 
-                                    if (newDistance < currentDistance) {
-                                        // Reverse the segment between i and j
-                                        const newTour = tour.slice(0, i);
-                                        const reversedSegment = tour.slice(i, j + 1).reverse();
-                                        const remainingTour = tour.slice(j + 1);
-                                        tour = newTour.concat(reversedSegment, remainingTour);
+                                    if (calculateTotalDistance(newTour, distanceMatrix) < calculateTotalDistance(tour, distanceMatrix)) {
+                                        tour = newTour;
                                         improved = true;
                                     }
                                 }
@@ -1408,12 +1461,12 @@ document.addEventListener('DOMContentLoaded', function() {
 
                     self.onmessage = function(e) {
                         try {
-                            const distanceMatrix = e.data;
+                            const { distanceMatrix, startIndex } = e.data;
                             if (!distanceMatrix || distanceMatrix.length === 0) {
                                 self.postMessage({ type: 'result', result: [] });
                                 return;
                             }
-                            const result = twoOptTsp(distanceMatrix);
+                            const result = twoOptTsp(distanceMatrix, startIndex);
                             self.postMessage({ type: 'result', result });
                         } catch (error) {
                             self.postMessage({ type: 'error', error: error.message });
@@ -1468,11 +1521,13 @@ document.addEventListener('DOMContentLoaded', function() {
                     tspProgressDiv.textContent = 'TSP Worker Error';
                 };
 
-                logDebug('Sending distance matrix to TSP worker...');
-                worker.postMessage(distanceMatrix);
+                const startIndex = parseInt(startStoreSelector.value, 10) || 0;
+                logDebug(`Sending distance matrix to TSP worker with start index: ${startIndex}`);
+                worker.postMessage({ distanceMatrix, startIndex });
                 logDebug('Distance matrix sent.');
 
             } else {
+                startStoreSelectorContainer.style.display = 'none';
                 if (filteredStores.length === 1) {
                     if (tspProgressDiv) {
                         tspProgressDiv.textContent = 'TSP not applicable for a single store.';
@@ -1487,6 +1542,7 @@ document.addEventListener('DOMContentLoaded', function() {
             }
 
         } else {
+            startStoreSelectorContainer.style.display = 'none';
             renderStores(Array.from(allStores.values()));
             logDebug('Postal code filter cleared. Showing all stores.');
         }
@@ -1496,6 +1552,15 @@ document.addEventListener('DOMContentLoaded', function() {
     applyFilterButton.addEventListener('click', function() {
         var filterPostalCode = postalCodeFilterInput.value.trim();
         applyPostalFilter(filterPostalCode);
+    });
+
+    // Event listener for start store selector
+    document.getElementById('startStoreSelector').addEventListener('change', function() {
+        var filterPostalCode = postalCodeFilterInput.value.trim();
+        if (filterPostalCode) {
+            localStorage.setItem('startStore-' + filterPostalCode, this.value);
+            applyPostalFilter(filterPostalCode);
+        }
     });
 
     // Event listener for clear filter button
@@ -1536,6 +1601,7 @@ document.addEventListener('DOMContentLoaded', function() {
             const store = transaction.objectStore(storeName);
             await store.clear();
             localStorage.removeItem('postal_data_ken_all_rome_timestamp');
+            postalCodeAddressCache = null; // Invalidate the in-memory cache
             logDebug('Postal code cache cleared.');
             alert('Postal code cache has been cleared.');
         } catch (error) {
