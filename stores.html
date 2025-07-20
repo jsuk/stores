@@ -16,6 +16,7 @@
         #debug-info { display: flex; max-height: 150px; border: 1px solid #ccc; background-color: #f9f9f9; }
         #debug-container { flex: 1; overflow-y: auto; padding: 5px; border-right: 1px solid #ccc; }
         #postal-code-container { flex: 1; overflow-y: auto; padding: 5px; }
+        #postal-code-list li.selected { background-color: lightblue; }
         #loading-overlay {
             position: fixed;
             top: 0;
@@ -61,6 +62,7 @@
     <div id="postal-code-container">
         <h3>Unique Postal Codes on Map</h3>
         <ul id="postal-code-list"></ul>
+        <div id="tsp-distance-container" style="margin-top: 10px;"></div>
     </div>
 </div>
 
@@ -78,6 +80,7 @@
     <button id="clearFilter">Clear Filter</button>
     <button id="useCurrentLocation">Use Current Location</button>
     <button id="clearPostalCache">Clear Postal Cache</button>
+    <button id="generateKml" disabled>Generate KML</button>
 </div>
 <div id="marker-count" style="margin-bottom: 10px;"></div>
 <div id="container">
@@ -281,6 +284,7 @@ document.addEventListener('DOMContentLoaded', function() {
 
     var map;
     var markers;
+    var routeLine;
 
     var allStores = new Map(); // Use a Map to store stores by ID, preventing duplicates
     
@@ -649,6 +653,21 @@ document.addEventListener('DOMContentLoaded', function() {
             });
     }
 
+    function getTextColorForBg(bgColor) {
+        const color = (bgColor.charAt(0) === '#') ? bgColor.substring(1, 7) : bgColor;
+        const r = parseInt(color.substring(0, 2), 16);
+        const g = parseInt(color.substring(2, 4), 16);
+        const b = parseInt(color.substring(4, 6), 16);
+        // HSP (Highly Sensitive Poo) equation from http://alienryderflex.com/hsp.html
+        const hsp = Math.sqrt(
+            0.299 * (r * r) +
+            0.587 * (g * g) +
+            0.114 * (b * b)
+        );
+        // Using the HSP value, determine whether the color is light or dark
+        return (hsp > 155) ? '#000000' : '#FFFFFF';
+    }
+
     // Simple hash function to generate a color from a string
     function stringToColor(str) {
         let hash = 0;
@@ -693,6 +712,9 @@ document.addEventListener('DOMContentLoaded', function() {
         logDebug('Rendering stores with visiting order: ' + JSON.stringify(visitingOrder));
         storeList.innerHTML = ''; // Clear existing list
         markers.clearLayers(); // Clear existing markers
+        if (routeLine) {
+            routeLine.remove();
+        }
 
         if (storesToRender && Array.isArray(storesToRender)) {
             // Apply exclusion filter
@@ -716,8 +738,9 @@ document.addEventListener('DOMContentLoaded', function() {
             storesToRender.forEach(function(store) {
                 if (store.latitude && store.longitude) {
                     var markerColor = stringToColor(store.postal_code || 'default');
+                    var textColor = getTextColorForBg(markerColor);
 
-                    let markerHtml = `<div style="background-color: ${markerColor}; width: 20px; height: 20px; border-radius: 50%; border: 2px solid white; display: flex; justify-content: center; align-items: center; color: black; font-weight: bold;">`;
+                    let markerHtml = `<div style="background-color: ${markerColor}; color: ${textColor}; width: 20px; height: 20px; border-radius: 50%; border: 2px solid white; display: flex; justify-content: center; align-items: center; font-weight: bold;">`;
                     if (orderMap.has(store.map_store_id)) {
                         markerHtml += `<span>${orderMap.get(store.map_store_id)}</span>`;
                         logDebug(`Store ${store.store_name} has order ${orderMap.get(store.map_store_id)}`);
@@ -816,6 +839,12 @@ document.addEventListener('DOMContentLoaded', function() {
                 }
             });
             updatePostalCodeList(storesToRender, visitingOrder !== null); // Update the postal code list
+
+            if (visitingOrder && storesToRender.length > 1) {
+                const latLngs = storesToRender.map(store => [store.latitude, store.longitude]);
+                routeLine = L.polyline(latLngs, { color: 'blue' }).addTo(map);
+                map.fitBounds(routeLine.getBounds());
+            }
         } else {
             updatePostalCodeList([], false); // Clear the list if no stores are rendered
         }
@@ -844,8 +873,26 @@ document.addEventListener('DOMContentLoaded', function() {
             stores.forEach((store, index) => {
                 const li = document.createElement('li');
                 li.textContent = `${index + 1}. ${store.store_name}`;
+                li.style.cursor = 'pointer';
+                li.onclick = () => handleTspStoreSelection(store, li);
                 postalCodeList.appendChild(li);
             });
+
+            if (stores.length > 1) {
+                let totalDistance = 0;
+                const distances = [];
+                for (let i = 0; i < stores.length - 1; i++) {
+                    const latlng1 = L.latLng(stores[i].latitude, stores[i].longitude);
+                    const latlng2 = L.latLng(stores[i+1].latitude, stores[i+1].longitude);
+                    const distance = latlng1.distanceTo(latlng2);
+                    distances.push((distance / 1000).toFixed(2) + ' km');
+                    totalDistance += distance;
+                }
+                const distanceDiv = document.createElement('div');
+                distanceDiv.style.marginTop = '10px';
+                distanceDiv.innerHTML = `<p><b>Distances:</b> ${distances.join(', ')}</p><p><b>Total Distance:</b> ${(totalDistance / 1000).toFixed(2)} km</p>`;
+                postalCodeList.appendChild(distanceDiv);
+            }
 
         } else {
             // Display unique postal codes
@@ -1148,10 +1195,123 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     }
 
+    let lastTspResult = null;
+    let lastPostalCode = null;
+    let tspSelectedStores = [];
+
+    function handleTspStoreSelection(store, listItem) {
+        const tspDistanceContainer = document.getElementById('tsp-distance-container');
+        if (!tspDistanceContainer) return;
+
+        const isSelected = listItem.classList.contains('selected');
+
+        if (isSelected) {
+            listItem.classList.remove('selected');
+            tspSelectedStores = tspSelectedStores.filter(s => s.map_store_id !== store.map_store_id);
+        } else {
+            if (tspSelectedStores.length < 2) {
+                listItem.classList.add('selected');
+                tspSelectedStores.push(store);
+            } else {
+                alert("You can only select two stores at a time. Please deselect one first.");
+                return;
+            }
+        }
+
+        if (tspSelectedStores.length === 2) {
+            const store1 = tspSelectedStores[0];
+            const store2 = tspSelectedStores[1];
+            const latlng1 = L.latLng(store1.latitude, store1.longitude);
+            const latlng2 = L.latLng(store2.latitude, store2.longitude);
+            const distance = latlng1.distanceTo(latlng2);
+            tspDistanceContainer.innerHTML = `
+                <p><b>Distance Calculation:</b></p>
+                <p>1. ${store1.store_name}</p>
+                <p>2. ${store2.store_name}</p>
+                <p><b>Distance:</b> ${(distance / 1000).toFixed(2)} km</p>
+            `;
+        } else if (tspSelectedStores.length === 1) {
+            const store1 = tspSelectedStores[0];
+            tspDistanceContainer.innerHTML = `
+                <p><b>Distance Calculation:</b></p>
+                <p>1. ${store1.store_name}</p>
+                <p><i>Select one more store to calculate the distance.</i></p>
+            `;
+        } else {
+            tspDistanceContainer.innerHTML = '';
+        }
+    }
+
+    function generateKML(orderedStores, postalCode) {
+        let kmlContent = `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <name>TSP Route for ${postalCode}</name>
+    <description>Optimal route for visiting stores in postal code ${postalCode}.</description>
+    <Style id="lineStyle">
+      <LineStyle>
+        <color>7f0000ff</color>
+        <width>4</width>
+      </LineStyle>
+    </Style>
+`;
+        orderedStores.forEach((store, index) => {
+            kmlContent += `
+    <Placemark>
+      <name>${index + 1}. ${store.store_name}</name>
+      <description>Postal Code: ${store.postal_code}</description>
+      <Point>
+        <coordinates>${store.longitude},${store.latitude},0</coordinates>
+      </Point>
+    </Placemark>
+`;
+        });
+
+        kmlContent += `
+    <Placemark>
+      <name>Route</name>
+      <styleUrl>#lineStyle</styleUrl>
+      <LineString>
+        <tessellate>1</tessellate>
+        <coordinates>
+`;
+        orderedStores.forEach(store => {
+            kmlContent += `${store.longitude},${store.latitude},0 `;
+        });
+        kmlContent += `
+        </coordinates>
+      </LineString>
+    </Placemark>
+  </Document>
+</kml>
+`;
+        return kmlContent;
+    }
+
+    document.getElementById('generateKml').addEventListener('click', function() {
+        if (lastTspResult) {
+            const kmlData = generateKML(lastTspResult, lastPostalCode);
+            const blob = new Blob([kmlData], { type: 'application/vnd.google-earth.kml+xml' });
+            const a = document.createElement('a');
+            a.href = URL.createObjectURL(blob);
+            a.download = `route_${lastPostalCode}.kml`;
+            a.click();
+        } else {
+            alert('No TSP result available to generate KML.');
+        }
+    });
+
     async function applyPostalFilter(postalCode) {
+        lastPostalCode = postalCode;
         const tspProgressDiv = document.getElementById('tsp-progress');
         if (tspProgressDiv) {
             tspProgressDiv.textContent = '';
+        }
+        
+        tspSelectedStores = [];
+        const tspDistanceContainer = document.getElementById('tsp-distance-container');
+        if (tspDistanceContainer) {
+            tspDistanceContainer.innerHTML = '';
         }
 
         if (postalCode) {
@@ -1248,9 +1408,18 @@ document.addEventListener('DOMContentLoaded', function() {
                         }
 
                         const orderedStores = visitingOrderIndices.map(index => filteredStores[index]);
-                        const visitingOrder = orderedStores.map(store => store.map_store_id);
                         
-                        renderStores(orderedStores, visitingOrder);
+                        // Filter the ordered stores by name before storing them
+                        const finalOrderedStores = orderedStores.filter(store => {
+                            const storeName = store.store_name || '';
+                            return !EXCLUDE_STORE_NAMES_CONTAINING.some(excludedString => storeName.includes(excludedString));
+                        });
+
+                        lastTspResult = finalOrderedStores;
+                        document.getElementById('generateKml').disabled = false;
+                        const visitingOrder = finalOrderedStores.map(store => store.map_store_id);
+                        
+                        renderStores(finalOrderedStores, visitingOrder);
                         tspProgressDiv.textContent = '';
                         worker.terminate();
                         logDebug('TSP worker terminated.');
