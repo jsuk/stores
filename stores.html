@@ -225,6 +225,9 @@
                     const prefecture = parts[1];
                     const city = parts[2];
                     const address = parts[3] || '';
+
+                    logDebug(`Postal Code: ${postalCode}, Prefecture: ${prefecture}, City: ${city}, Address: ${address}`);
+
                     if (!postalData[postalCode]) {
                         postalData[postalCode] = [];
                     }
@@ -1124,6 +1127,12 @@ document.addEventListener('DOMContentLoaded', function() {
                     logDebug('Successfully converted TopoJSON to GeoJSON.');
 
                     const geoJsonLayer = L.geoJSON(geojsonData, {
+                        onEachFeature: function (feature, layer) {
+                            if (feature.properties) {
+                                const { S_NAME, PREF_NAME, CITY_NAME } = feature.properties;
+                                logDebug(`TopoJSON Feature Properties: S_NAME=${S_NAME}, PREF_NAME=${PREF_NAME}, CITY_NAME=${CITY_NAME}`);
+                            }
+                        },
                         style: function(feature) {
                             return {
                                 color: color,
