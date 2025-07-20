@@ -1336,43 +1336,74 @@ document.addEventListener('DOMContentLoaded', function() {
 
                 logDebug('Attempting to create TSP worker from blob...');
                 const workerCode = `
-                    function nearestNeighborTsp(distanceMatrix) {
+                    // Function to calculate the total distance of a tour
+                    function calculateTotalDistance(tour, distanceMatrix) {
+                        let distance = 0;
+                        for (let i = 0; i < tour.length - 1; i++) {
+                            distance += distanceMatrix[tour[i]][tour[i + 1]];
+                        }
+                        // Add distance from last city back to the first, if you want a closed loop
+                        // distance += distanceMatrix[tour[tour.length - 1]][tour[0]];
+                        return distance;
+                    }
+
+                    // 2-opt TSP solver
+                    function twoOptTsp(distanceMatrix) {
                         const n = distanceMatrix.length;
                         if (n === 0) return [];
 
-                        self.postMessage({ type: 'progress', count: 0, total: n });
-
+                        // Initial tour using nearest neighbor
+                        let tour = [];
                         let unvisited = new Set(Array.from({ length: n }, (_, i) => i));
-                        let path = [];
                         let currentCity = 0;
-
-                        path.push(currentCity);
+                        tour.push(currentCity);
                         unvisited.delete(currentCity);
-
-                        self.postMessage({ type: 'progress', count: 1, total: n });
 
                         while (unvisited.size > 0) {
                             let nearestCity = -1;
                             let minDistance = Infinity;
-
                             for (const city of unvisited) {
                                 if (distanceMatrix[currentCity][city] < minDistance) {
                                     minDistance = distanceMatrix[currentCity][city];
                                     nearestCity = city;
                                 }
                             }
-
-                            if (nearestCity === -1) {
-                                break;
+                            if (nearestCity !== -1) {
+                                tour.push(nearestCity);
+                                unvisited.delete(nearestCity);
+                                currentCity = nearestCity;
+                            } else {
+                                break; // Should not happen in a connected graph
                             }
-
-                            path.push(nearestCity);
-                            unvisited.delete(nearestCity);
-                            currentCity = nearestCity;
-
-                            self.postMessage({ type: 'progress', count: path.length, total: n });
                         }
-                        return path;
+
+                        // 2-opt refinement
+                        let improved = true;
+                        let iteration = 0;
+                        const maxIterations = 1000; // Safety break
+                        while (improved && iteration < maxIterations) {
+                            improved = false;
+                            for (let i = 1; i < n - 2; i++) {
+                                for (let j = i + 1; j < n - 1; j++) {
+                                    // Current tour edges: (i-1, i) and (j, j+1)
+                                    // Proposed new edges: (i-1, j) and (i, j+1)
+                                    const currentDistance = distanceMatrix[tour[i - 1]][tour[i]] + distanceMatrix[tour[j]][tour[j + 1]];
+                                    const newDistance = distanceMatrix[tour[i - 1]][tour[j]] + distanceMatrix[tour[i]][tour[j + 1]];
+
+                                    if (newDistance < currentDistance) {
+                                        // Reverse the segment between i and j
+                                        const newTour = tour.slice(0, i);
+                                        const reversedSegment = tour.slice(i, j + 1).reverse();
+                                        const remainingTour = tour.slice(j + 1);
+                                        tour = newTour.concat(reversedSegment, remainingTour);
+                                        improved = true;
+                                    }
+                                }
+                            }
+                            iteration++;
+                            self.postMessage({ type: 'progress', count: iteration, total: maxIterations });
+                        }
+                        return tour;
                     }
 
                     self.onmessage = function(e) {
@@ -1382,7 +1413,7 @@ document.addEventListener('DOMContentLoaded', function() {
                                 self.postMessage({ type: 'result', result: [] });
                                 return;
                             }
-                            const result = nearestNeighborTsp(distanceMatrix);
+                            const result = twoOptTsp(distanceMatrix);
                             self.postMessage({ type: 'result', result });
                         } catch (error) {
                             self.postMessage({ type: 'error', error: error.message });
