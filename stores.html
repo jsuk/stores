@@ -719,7 +719,7 @@ document.addEventListener('DOMContentLoaded', function() {
             return;
         }
 
-        const-map = L.map('map', {
+        map = L.map('map', {
             contextmenu: true,
             contextmenuWidth: 140,
             contextmenuItems: [{
@@ -756,7 +756,7 @@ document.addEventListener('DOMContentLoaded', function() {
                     fetchAndCacheStores(true); // Incremental load
                 }
             }]
-        });
+        }).setView([35.681236, 139.767125], 13); // Default view (Tokyo Station)
 
         L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
             attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
@@ -765,6 +765,55 @@ document.addEventListener('DOMContentLoaded', function() {
 
         markers = L.featureGroup().addTo(map); // Initialize markers after map is defined
         logDebug('Marker feature group added.');
+
+        // Add the new TopoJSON layer and fit map to its bounds
+        fetch('https://geoshape.ex.nii.ac.jp/ka/topojson/2020/11/r2ka11224.topojson')
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                return response.json();
+            })
+            .then(data => {
+                logDebug('TopoJSON data fetched successfully.');
+                
+                // It's good practice to check if the object key exists
+                const objectKey = Object.keys(data.objects)[0];
+                if (!objectKey) {
+                    throw new Error('No objects found in TopoJSON data.');
+                }
+                logDebug(`Found TopoJSON object key: ${objectKey}`);
+
+                // Convert TopoJSON to GeoJSON
+                const geojsonData = topojson.feature(data, data.objects[objectKey]);
+                logDebug('Successfully converted TopoJSON to GeoJSON.');
+
+                const geoJsonLayer = L.geoJSON(geojsonData, {
+                    style: function(feature) {
+                        return {
+                            color: 'green', // Changed color for visibility
+                            weight: 3,
+                            opacity: 0.8
+                        };
+                    }
+                });
+                
+                geoJsonLayer.addTo(map);
+                logDebug('GeoJSON layer added to the map.');
+
+                // Fit the map view to the bounds of the new layer
+                const bounds = geoJsonLayer.getBounds();
+                if (bounds.isValid()) {
+                    map.fitBounds(bounds);
+                    logDebug('Map view fitted to GeoJSON layer bounds.');
+                } else {
+                    logDebug('Could not get valid bounds from GeoJSON layer.');
+                }
+            })
+            .catch(error => {
+                logDebug('Error loading or processing TopoJSON/GeoJSON layer: ' + error);
+                console.error('Error with TopoJSON/GeoJSON layer:', error);
+            });
 
         if (navigator.geolocation) {
             logDebug('Attempting to get current location for initial view...');
@@ -775,6 +824,21 @@ document.addEventListener('DOMContentLoaded', function() {
                 logDebug(`Map centered on current location: Lat ${lat}, Lng ${lon}`);
                 map.whenReady(function() {
                     logDebug('Map ready event fired.');
+		    const cachedData = localStorage.getItem(CACHE_KEY);
+		    if (cachedData) {
+		        const { timestamp, data } = JSON.parse(cachedData);
+		    	const now = new Date().getTime();
+		    	if (now - timestamp < CACHE_EXPIRATION_TIME) {
+		    		logDebug('Loading stores from cache.');
+		    		data.forEach(store => allStores.set(store.map_store_id, store));
+		    		renderStores(Array.from(allStores.values()));
+		    		hideLoading();
+		    		return; // Exit if we loaded from cache
+		    	} else {
+		    	        logDebug('Cached data expired.');
+		    		localStorage.removeItem(CACHE_KEY);
+		    	}
+		    }
                     fetchAndCacheStores(false);
                 });
             }, function(error) {
@@ -782,6 +846,20 @@ document.addEventListener('DOMContentLoaded', function() {
                 map.setView([35.681236, 139.767125], 13); // Default view
                 map.whenReady(function() {
                     logDebug('Map ready event fired.');
+		    if (cachedData) {
+		        const { timestamp, data } = JSON.parse(cachedData);
+		    	const now = new Date().getTime();
+		    	if (now - timestamp < CACHE_EXPIRATION_TIME) {
+		    		logDebug('Loading stores from cache.');
+		    		data.forEach(store => allStores.set(store.map_store_id, store));
+		    		renderStores(Array.from(allStores.values()));
+		    		hideLoading();
+		    		return; // Exit if we loaded from cache
+		    	} else {
+		    	        logDebug('Cached data expired.');
+		    		localStorage.removeItem(CACHE_KEY);
+		    	}
+		    }
                     fetchAndCacheStores(false);
                 });
             });
