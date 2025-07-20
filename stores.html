@@ -13,7 +13,9 @@
         #store-list { flex: 1; overflow-y: auto; padding: 10px; }
         .store-item { cursor: pointer; padding: 5px; }
         .store-item:hover { background-color: #f0f0f0; }
-        #debug-info { max-height: 150px; overflow-y: auto; border: 1px solid #ccc; padding: 5px; background-color: #f9f9f9; }
+        #debug-info { display: flex; max-height: 150px; border: 1px solid #ccc; background-color: #f9f9f9; }
+        #debug-container { flex: 1; overflow-y: auto; padding: 5px; border-right: 1px solid #ccc; }
+        #postal-code-container { flex: 1; overflow-y: auto; padding: 5px; }
         #loading-overlay {
             position: fixed;
             top: 0;
@@ -49,8 +51,16 @@
 </div>
 
 <div id="debug-info">
-    <h3>Debug Information</h3>
-    <pre id="debug-output" style="white-space: pre-wrap;"></pre>
+    <div id="debug-container">
+        <h3>Debug Information</h3>
+        <pre id="debug-output" style="white-space: pre-wrap;"></pre>
+        <h3>Cached Postal Data (Sample)</h3>
+        <pre id="postal-data-sample" style="white-space: pre-wrap;"></pre>
+    </div>
+    <div id="postal-code-container">
+        <h3>Unique Postal Codes on Map</h3>
+        <ul id="postal-code-list"></ul>
+    </div>
 </div>
 
 <div id="recent-clicks" style="border: 1px solid black; padding: 10px; margin-bottom: 10px;">
@@ -66,6 +76,7 @@
     <button id="applyFilter">Apply Filter</button>
     <button id="clearFilter">Clear Filter</button>
     <button id="useCurrentLocation">Use Current Location</button>
+    <button id="clearPostalCache">Clear Postal Cache</button>
 </div>
 <div id="marker-count" style="margin-bottom: 10px;"></div>
 <div id="container">
@@ -97,9 +108,171 @@
     <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet-contextmenu/1.4.0/leaflet.contextmenu.min.js"></script>
     <script>logDebug('Leaflet-Contextmenu.js loaded.');</script>
 
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
 <script>
+    // IndexedDB helper functions
+    const dbName = 'PostalDataDB';
+    const storeName = 'postalCodes';
+
+    function openDB() {
+        return new Promise((resolve, reject) => {
+            const request = indexedDB.open(dbName, 1);
+            request.onupgradeneeded = (event) => {
+                const db = event.target.result;
+                if (!db.objectStoreNames.contains(storeName)) {
+                    db.createObjectStore(storeName, { keyPath: 'postalCode' });
+                }
+            };
+            request.onsuccess = (event) => {
+                resolve(event.target.result);
+            };
+            request.onerror = (event) => {
+                reject('IndexedDB error: ' + event.target.errorCode);
+            };
+        });
+    }
+
+    async function saveDataToDB(data) {
+        const db = await openDB();
+        const transaction = db.transaction(storeName, 'readwrite');
+        const store = transaction.objectStore(storeName);
+        Object.keys(data).forEach(postalCode => {
+            store.put({ postalCode, data: data[postalCode] });
+        });
+        return transaction.complete;
+    }
+
+    async function getDataFromDB() {
+        const db = await openDB();
+        const transaction = db.transaction(storeName, 'readonly');
+        const store = transaction.objectStore(storeName);
+        const allRecords = await new Promise((resolve, reject) => {
+            const request = store.getAll();
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        });
+
+        const postalData = {};
+        allRecords.forEach(record => {
+            postalData[record.postalCode] = record.data;
+        });
+        return postalData;
+    }
+
+    // Function to fetch, unzip, and cache the postal code data
+    async function fetchAndCachePostalData() {
+        const cacheTimestampKey = 'postal_data_ken_all_rome_timestamp';
+        const cacheDuration = 24 * 60 * 60 * 1000; // 24 hours
+
+        const cachedTimestamp = localStorage.getItem(cacheTimestampKey);
+
+        if (cachedTimestamp && (new Date().getTime() - cachedTimestamp < cacheDuration)) {
+            logDebug('Using cached postal data from IndexedDB.');
+            return await getDataFromDB();
+        }
+
+        try {
+            if (typeof JSZip === 'undefined') {
+                throw new Error('JSZip library is not loaded. Cannot unzip the file.');
+            }
+            logDebug('Fetching postal data zip file...');
+            showLoading();
+            const response = await fetch('http://localhost:8080/zipcode/dl/roman/KEN_ALL_ROME.zip');
+            if (!response.ok) {
+                throw new Error(`Failed to fetch zip file: ${response.statusText}`);
+            }
+            const zipBlob = await response.blob();
+            logDebug('Zip file fetched. Unzipping...');
+
+            const jszip = new JSZip();
+            const zip = await jszip.loadAsync(zipBlob);
+            const csvFileName = Object.keys(zip.files)[0];
+            if (!csvFileName) {
+                throw new Error('No file found in the zip archive.');
+            }
+
+            logDebug(`Unzipping file: ${csvFileName}`);
+            const csvContentUint8Array = await zip.files[csvFileName].async('uint8array');
+            const decoder = new TextDecoder('shift-jis');
+            const csvContent = decoder.decode(csvContentUint8Array);
+            logDebug('CSV content extracted. Parsing...');
+
+            // Simple CSV parser
+            const lines = csvContent.split('\n');
+            const postalData = {};
+            for (const line of lines) {
+                const parts = line.split(',').map(item => item.trim().replace(/"/g, ''));
+                if (parts.length >= 3) {
+                    const postalCode = parts[0];
+                    const prefecture = parts[1];
+                    const city = parts[2];
+                    const address = parts[3] || '';
+                    if (!postalData[postalCode]) {
+                        postalData[postalCode] = [];
+                    }
+                    postalData[postalCode].push({ prefecture, city, address });
+                }
+            }
+
+            logDebug('Parsing complete. Caching data to IndexedDB...');
+            await saveDataToDB(postalData);
+            localStorage.setItem(cacheTimestampKey, new Date().getTime());
+            logDebug('Postal data cached successfully in IndexedDB.');
+            return postalData; // Return newly fetched data
+        } catch (error) {
+            logDebug(`Error fetching or processing postal data: ${error}`);
+            console.error('Error fetching or processing postal data:', error);
+            return null; // Return null on error
+        } finally {
+            hideLoading();
+        }
+    }
+
+    // Function to get postal data from cache
+    async function getPostalData(postalCode) {
+        const postalData = await getDataFromDB();
+        return postalData[postalCode] || null;
+    }
+
+    // Function to display a sample of the cached postal data
+    function displayCachedDataSample(postalData) {
+        const sampleContainer = document.getElementById('postal-data-sample');
+        if (!sampleContainer) return;
+
+        if (postalData && Object.keys(postalData).length > 0) {
+            // Take the first 10 items from the cached data to display as a sample.
+            const first10Entries = Object.entries(postalData).slice(0, 10);
+            const logMessage = 'logDebug: Displayed sample of cached postal data.';
+            sampleContainer.textContent = logMessage + '\n\n' + JSON.stringify(first10Entries, null, 2);
+            logDebug('Displayed sample of cached postal data.'); // Also log to the main debug area
+        } else if (postalData) {
+            const logMessage = 'logDebug: Cached postal data was found but is empty.';
+            sampleContainer.textContent = logMessage;
+            logDebug('Cached postal data was found but is empty.');
+        } else {
+            const logMessage = 'logDebug: No cached data found or failed to fetch.';
+            sampleContainer.textContent = logMessage;
+            logDebug('No postal data available to display as sample.');
+        }
+    }
+</script>
+
+<script>
+    const loadingOverlay = document.getElementById('loading-overlay');
+
+    function showLoading() {
+        if (loadingOverlay) loadingOverlay.style.display = 'flex';
+    }
+
+    function hideLoading() {
+        if (loadingOverlay) loadingOverlay.style.display = 'none';
+    }
 document.addEventListener('DOMContentLoaded', function() {
     logDebug('DOM fully loaded and parsed.');
+    fetchAndCachePostalData().then(postalData => {
+        displayCachedDataSample(postalData);
+    });
+
 
     var map;
     var markers;
@@ -118,15 +291,7 @@ document.addEventListener('DOMContentLoaded', function() {
     var markerCountDiv = document.getElementById('marker-count');
     var apiUrl = 'http://localhost:8080/mmeu/api/v3/stores?client_id=integrated&longitude=139.641021&latitude=35.909794'; // Default API URL
 
-    const loadingOverlay = document.getElementById('loading-overlay');
-
-    function showLoading() {
-        if (loadingOverlay) loadingOverlay.style.display = 'flex';
-    }
-
-    function hideLoading() {
-        if (loadingOverlay) loadingOverlay.style.display = 'none';
-    }
+    
 
 
     // List of strings to filter out from store names
@@ -196,7 +361,7 @@ document.addEventListener('DOMContentLoaded', function() {
 	"セキ薬局", "ｾｷﾔｯｷｮｸ",
         "閉店", // Closed
         "セブンイレブン", "ｾﾌﾞﾝｲﾚﾌﾞﾝ",
-        "ファミリーマート", "ﾌｧﾐﾘｰﾏｰﾄ",
+        "ファミリーマート", "ﾌｧ��ﾘｰﾏｰﾄ",
         "ローソン", "ﾛｰｿﾝ",
         "ミニストップ", "ﾐﾆｽﾄｯﾌﾟ",
         "イオン", "イオン",
@@ -210,6 +375,7 @@ document.addEventListener('DOMContentLoaded', function() {
         "すき家", "ｽｷﾔ",
         "松屋", "ﾏﾂﾔ",
         "CoCo壱番屋", "CoCo壱番屋",
+	"cocos", "ココス",
         "ガスト", "ｶﾞｽﾄ",
         "サイゼリヤ", "ｻｲｾﾞﾘﾔ",
         "ドラッグエース＋調剤", "ﾄﾞﾗｯｸﾞｴｰｽ＋ﾁｮｳｻﾞｲ",
@@ -218,7 +384,7 @@ document.addEventListener('DOMContentLoaded', function() {
         "無印良品", "ﾑｼﾞﾙｼﾘｮｳﾋﾝ",
         "ニトリ", "ﾆﾄﾘ",
         "ケーズデンキ", "ｹｰｽﾞﾃﾞﾝｷ",
-        "ヤマダ電機", "ﾔﾏﾀﾞﾃﾞﾝｷ",
+        "ヤマダ電機", "ﾔﾏﾀ���ﾃﾞﾝｷ",
         "ビックカメラ", "ﾋﾞｯｸｶﾒﾗ",
         "ヨドバシカメラ", "ﾖﾄﾞ\u0008ﾞｼｶﾒﾗ",
         "エディオン", "エディオン",
@@ -261,7 +427,7 @@ document.addEventListener('DOMContentLoaded', function() {
         "キャンドゥ", "ｷｬﾝﾄﾞｩ",
         "ワッツ", "ﾜｯﾂ",
         "meets.", "meets.",
-        "シルク", "ｼﾙｸ",
+        "シルク", "ｼ���ｸ",
         "Can★Do", "Can★Do",
         "Seria", "Seria",
         "Daiso", "Daiso",
@@ -408,13 +574,13 @@ document.addEventListener('DOMContentLoaded', function() {
         "ミニストップ＋ドラッグ", "ﾐﾆｽﾄｯﾌﾟ＋ﾄﾞﾗｯｸﾞ",
         "スギ薬局＋調剤", "ｽｷﾞﾔｯｷｮｸ＋ﾁｮｳｻﾞｲ",
         "マツモトキヨシ＋調剤", "ﾏﾂﾓﾄｷﾖｼ＋ﾁｮｳｻﾞｲ",
-        "ツルハドラッグ＋調剤", "ﾂﾙﾊﾄﾞﾗｯｸﾞ＋ﾁｮｳｻﾞｲ",
+        "ツルハドラッグ＋調剤", "ﾂﾙﾊﾄﾞﾗｯｸﾞ��ﾁｮｳｻﾞｲ",
         "サンドラッグ＋調剤", "ｻﾝﾄﾞﾗｯｸﾞ＋ﾁｮｳｻﾞｲ",
         "ウェルシア＋調剤", "ｳｪﾙｼｱ＋ﾁｮｳ\u0008ﾞｲ",
         "コスモス＋調剤", "ｺｽﾓｽ＋ﾁｮｳｻﾞｲ",
         "クリエイトエス・ディー＋調剤", "ｸﾘｴｲﾄｴｽ･ﾃﾞｨｰ＋ﾁｮｳｻﾞｲ",
         "ココカラファイン＋調剤", "ｺｺｶﾗﾌｧｲﾝ＋ﾁｮｳｻﾞｲ",
-        "富士薬品＋調剤", "ﾌｼﾞﾔｸﾋﾟﾝ＋ﾁｮｳｻﾞｲ",
+        "富士薬品＋調剤", "ﾌｼﾞﾔｸﾋﾝ＋ﾁｮｳｻﾞｲ",
         "クスリのアオキ＋調剤", "ｸｽﾘﾉｱｵｷ＋ﾁｮｳｻﾞｲ",
         "V・ドラッグ＋調剤", "V･ﾄﾞﾗｯｸﾞ＋ﾁｮｳｻﾞｲ",
         "キリン堂＋調剤", "ｷﾘﾝﾄﾞｳ＋ﾁｮｳｻﾞｲ",
@@ -628,7 +794,42 @@ document.addEventListener('DOMContentLoaded', function() {
                     storeList.appendChild(storeItem);
                 }
             });
+            updatePostalCodeList(storesToRender); // Update the postal code list
         } else {
+            updatePostalCodeList([]); // Clear the list if no stores are rendered
+        }
+    }
+
+    // Function to update the list of unique postal codes
+    async function updatePostalCodeList(stores) {
+        const postalCodeList = document.getElementById('postal-code-list');
+        if (!postalCodeList) return;
+
+        const uniquePostalCodes = [...new Set(stores.map(store => store.postal_code).filter(Boolean))];
+        uniquePostalCodes.sort();
+
+        postalCodeList.innerHTML = ''; // Clear existing list
+        for (const code of uniquePostalCodes) {
+            const postalInfo = await getPostalData(code);
+            let addressString = '';
+            if (postalInfo && postalInfo.length > 0) {
+                const firstEntry = postalInfo[0];
+                addressString = `${firstEntry.prefecture}, ${firstEntry.city}, ${firstEntry.address} - `;
+            }
+
+            const li = document.createElement('li');
+            const a = document.createElement('a');
+            a.href = '#';
+            a.textContent = addressString + code;
+            a.style.cursor = 'pointer';
+            a.style.textDecoration = 'underline';
+            a.onclick = function(e) {
+                e.preventDefault();
+                postalCodeFilterInput.value = code;
+                applyFilterButton.click();
+            };
+            li.appendChild(a);
+            postalCodeList.appendChild(li);
         }
     }
 
@@ -904,12 +1105,19 @@ document.addEventListener('DOMContentLoaded', function() {
     }
 
     // Event listener for filter button
-    applyFilterButton.addEventListener('click', function() {
+    applyFilterButton.addEventListener('click', async function() {
         var filterPostalCode = postalCodeFilterInput.value.trim();
         if (filterPostalCode) {
             var filteredStores = Array.from(allStores.values()).filter(store => store.postal_code === filterPostalCode);
             renderStores(filteredStores);
             logDebug('Filtered by postal code: ' + filterPostalCode + '. Found ' + filteredStores.length + ' stores.');
+
+            const postalInfo = await getPostalData(filterPostalCode);
+            if (postalInfo) {
+                logDebug(`Japan Post Data for ${filterPostalCode}: ${JSON.stringify(postalInfo)}`);
+                // You can display this information somewhere on the page if you want
+            }
+
         } else {
             renderStores(Array.from(allStores.values())); // If filter is empty, show all stores
             logDebug('Postal code filter cleared. Showing all stores.');
@@ -947,6 +1155,22 @@ document.addEventListener('DOMContentLoaded', function() {
         }
     });
 
+    // Event listener for "Clear Postal Cache" button
+    document.getElementById('clearPostalCache').addEventListener('click', async function() {
+        try {
+            const db = await openDB();
+            const transaction = db.transaction(storeName, 'readwrite');
+            const store = transaction.objectStore(storeName);
+            await store.clear();
+            localStorage.removeItem('postal_data_ken_all_rome_timestamp');
+            logDebug('Postal code cache cleared.');
+            alert('Postal code cache has been cleared.');
+        } catch (error) {
+            logDebug(`Error clearing postal code cache: ${error}`);
+            alert('Error clearing postal code cache.');
+        }
+    });
+
     // Initialize map and fetch stores
     var jsStatusDiv = document.getElementById('js-status');
     if (jsStatusDiv) {
@@ -955,5 +1179,7 @@ document.addEventListener('DOMContentLoaded', function() {
     initializeMapWithLocation();
 });
 </script>
+</body>
+</html>
 </body>
 </html>
