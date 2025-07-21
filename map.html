@@ -1,28 +1,12 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <title>SPARQL-Enhanced Geo Map</title>
+    <title>TopoJSON with Different Colors</title>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
     <style>
-        body { margin: 0; padding: 0; }
-        #map { height: 100vh; width: 100%; }
-        .leaflet-control-container .leaflet-top.leaflet-right {
-            padding-top: 10px;
-            padding-right: 10px;
-        }
-        .sparql-control {
-            background: #fff;
-            padding: 10px;
-            border-radius: 5px;
-            box-shadow: 0 1px 5px rgba(0,0,0,0.65);
-        }
-        .sparql-control button {
-            display: block;
-            width: 100%;
-            margin-bottom: 5px;
-        }
+        #map { height: 100vh; }
     </style>
 </head>
 <body>
@@ -31,213 +15,77 @@
 
 <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
 <script src="https://unpkg.com/topojson-client@3"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
-<script src="https://unpkg.com/wellknown@0.5.0/wellknown.js"></script>
 
 <script>
-    // --- Configuration ---
-    const dbName = 'MapDataCache';
-    const dbVersion = 10; // Incremented for SPARQL client focus
-    const topoStoreName = 'topojson_store';
-    const postalStoreName = 'postal_store';
-    const sparqlCacheStore = 'sparql_cache';
+    // 1. Create the map
+    var map = L.map('map').setView([35.36, 139.45], 10); // Centered roughly on the Kanagawa area
 
-    // --- SPARQL Client Implementation ---
-    class SparqlClient {
-        constructor(endpoint) {
-            this.endpoint = endpoint;
-        }
-
-        async query(sparqlQuery) {
-            console.log("Executing SPARQL query...");
-            const fullUrl = `${this.endpoint}?query=${encodeURIComponent(sparqlQuery)}&output=json`;
-            const response = await fetch(fullUrl, {
-                headers: { 'Accept': 'application/sparql-results+json' }
-            });
-            if (!response.ok) {
-                throw new Error(`SPARQL query failed with status ${response.status}: ${response.statusText}`);
-            }
-            return response.json();
-        }
-    }
-
-    const SparqlQueries = {
-        getCityInfo: (cityCode) => `
-            PREFIX ic: <http://imi.go.jp/ns/core/rdf#>
-            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-            SELECT ?name ?lat ?long WHERE {
-              ?uri ic:jisx0402 "${cityCode}";
-                   rdfs:label ?name ;
-                   ic:representativePoint ?point .
-              ?point ic:latitude ?lat;
-                     ic:longitude ?long .
-            } LIMIT 1`,
-        getCityBoundary: (cityCode) => `
-            PREFIX ic: <http://imi.go.jp/ns/core/rdf#>
-            PREFIX geo: <http://www.opengis.net/ont/geosparql#>
-            SELECT ?wkt WHERE {
-              ?uri ic:jisx0402 "${cityCode}";
-                   ic:boundary ?geometry .
-              ?geometry geo:asWKT ?wkt .
-            } LIMIT 1`
-    };
-
-    // --- IndexedDB Logic ---
-    function openDb() {
-        return new Promise((resolve, reject) => {
-            if (!window.indexedDB) reject("IndexedDB not supported.");
-            const request = indexedDB.open(dbName, dbVersion);
-            request.onerror = (e) => reject("Database error: " + e.target.errorCode);
-            request.onsuccess = (e) => resolve(e.target.result);
-            request.onupgradeneeded = (e) => {
-                let db = e.target.result;
-                if (!db.objectStoreNames.contains(topoStoreName)) db.createObjectStore(topoStoreName);
-                if (!db.objectStoreNames.contains(postalStoreName)) db.createObjectStore(postalStoreName);
-                if (!db.objectStoreNames.contains(sparqlCacheStore)) db.createObjectStore(sparqlCacheStore);
-            };
-        });
-    }
-
-    function getFromDb(db, storeName, key) {
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction(storeName, 'readonly');
-            const request = tx.objectStore(storeName).get(key);
-            request.onsuccess = (e) => resolve(e.target.result);
-            request.onerror = (e) => reject("DB get error: " + e.target.errorCode);
-        });
-    }
-
-    function putInDb(db, storeName, key, value) {
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction(storeName, 'readwrite');
-            tx.objectStore(storeName).put(value, key);
-            tx.oncomplete = () => resolve();
-            tx.onerror = (e) => reject("DB put error: " + e.target.errorCode);
-        });
-    }
-
-    // --- Data Loading & Caching ---
-    // ... (loadPostalData and loadTopoJsonData remain the same)
-
-    // --- Map Logic ---
-    const map = L.map('map').setView([35.82, 139.68], 13); // Centered on Warabi
+    // 2. Add OpenStreetMap tile layer
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
     }).addTo(map);
 
-    let currentSparqlLayer = null; // To hold the layer from a SPARQL query
-
-    // --- UI Controls ---
-    const SparqlControl = L.Control.extend({
-        onAdd: function(map) {
-            const container = L.DomUtil.create('div', 'sparql-control');
-            container.innerHTML = `
-                <h4>SPARQL Queries</h4>
-                <button id="btn-warabi-center">Show Warabi Center</button>
-                <button id="btn-warabi-boundary">Show Warabi Boundary (Experimental)</button>
-                <button id="btn-run-sample-sparql">Run Sample SPARQL</button>
-            `;
-            return container;
+    // 3. Function to generate a random color
+    function getRandomColor() {
+        var letters = '0123456789ABCDEF';
+        var color = '#';
+        for (var i = 0; i < 6; i++) {
+            color += letters[Math.floor(Math.random() * 16)];
         }
-    });
-    new SparqlControl({ position: 'topright' }).addTo(map);
+        return color;
+    }
 
-    // --- Event Handlers ---
-    document.getElementById('btn-warabi-center').addEventListener('click', async () => {
-        try {
-            const client = new SparqlClient('https://data.e-stat.go.jp/lod/sparql/alldata/query');
-            const query = SparqlQueries.getCityInfo("11223"); // Warabi city code
-            
-            const db = await openDb();
-            let result = await getFromDb(db, sparqlCacheStore, query);
-            if (!result) {
-                console.log("Fetching from SPARQL endpoint...");
-                result = await client.query(query);
-                await putInDb(db, sparqlCacheStore, query, result);
-            } else {
-                console.log("Loading from SPARQL cache.");
+    // 4. Define the styling for each feature
+    function styleFeature(feature) {
+        return {
+            color: getRandomColor(),
+            weight: 2,
+            opacity: 1,
+            fillOpacity: 0.7
+        };
+    }
+    
+    // 5. Function to add popups
+    function onEachFeature(feature, layer) {
+        var properties = feature.properties;
+        if (properties) {
+            var popupContent = "<h4>Properties</h4><ul>";
+            for (var key in properties) {
+                popupContent += "<li><strong>" + key + ":</strong> " + properties[key] + "</li>";
             }
-
-            if (currentSparqlLayer) map.removeLayer(currentSparqlLayer);
-
-            if (result.results.bindings.length > 0) {
-                const data = result.results.bindings[0];
-                const lat = parseFloat(data.lat.value);
-                const lng = parseFloat(data.long.value);
-                const name = data.name.value;
-                currentSparqlLayer = L.marker([lat, lng]).addTo(map)
-                    .bindPopup(`<b>${name}</b><br>(Center Point from SPARQL)`)
-                    .openPopup();
-                map.panTo([lat, lng]);
-            } else {
-                alert("Warabi City center point not found.");
-            }
-        } catch (err) {
-            alert("Error fetching data: " + err.message);
+            popupContent += "</ul>";
+            layer.bindPopup(popupContent);
         }
-    });
+    }
 
-    document.getElementById('btn-warabi-boundary').addEventListener('click', async () => {
-        alert("Note: Our experiments showed this query will likely return no results from the e-Stat endpoint, but we are running it to demonstrate the client's functionality.");
-        // ... (Logic to run the boundary query would go here, similar to the center point)
-    });
-
-    document.getElementById('btn-run-sample-sparql').addEventListener('click', async () => {
-        try {
-            const sparqlQuery = await fetch('sample.sparql').then(res => res.text());
-            const client = new SparqlClient('https://sparql.odp.jig.jp/api/v1/sparql');
-            
-            const db = await openDb();
-            let result = await getFromDb(db, sparqlCacheStore, sparqlQuery);
-            if (!result) {
-                console.log("Fetching from SPARQL endpoint...");
-                result = await client.query(sparqlQuery);
-                await putInDb(db, sparqlCacheStore, sparqlQuery, result);
+    // 6. Fetch and process the TopoJSON data
+    var url = "https://geoshape.ex.nii.ac.jp/ka/topojson/2020/11/r2ka11224.topojson";
+    
+    fetch(url)
+        .then(response => response.json())
+        .then(topojsonData => {
+            // Find the correct object key in the TopoJSON file
+            var geojsonCollection;
+            if (topojsonData.objects.r2ka11224) {
+                geojsonCollection = topojson.feature(topojsonData, topojsonData.objects.r2ka11224);
             } else {
-                console.log("Loading from SPARQL cache.");
+                // Fallback if the object name is different
+                var key = Object.keys(topojsonData.objects)[0];
+                geojsonCollection = topojson.feature(topojsonData, topojsonData.objects[key]);
             }
 
-            if (currentSparqlLayer) {
-                if (Array.isArray(currentSparqlLayer)) {
-                    currentSparqlLayer.forEach(layer => map.removeLayer(layer));
-                } else {
-                    map.removeLayer(currentSparqlLayer);
-                }
-            }
+            // Create the GeoJSON layer
+            var geojsonLayer = L.geoJSON(geojsonCollection, {
+                style: styleFeature,
+                onEachFeature: onEachFeature
+            }).addTo(map);
 
-            if (result.results.bindings.length > 0) {
-                currentSparqlLayer = [];
-                result.results.bindings.forEach(binding => {
-                    const wkt = binding.geom.value;
-                    const geojson = wellknown.parse(wkt);
-                    const layer = L.geoJSON(geojson).addTo(map);
-                    layer.bindPopup(`<b>${binding.municipality.value}</b><br>${binding.area.value}`);
-                    currentSparqlLayer.push(layer);
-                });
-                // Pan to the first geometry in the results
-                const firstGeoJson = wellknown.parse(result.results.bindings[0].geom.value);
-                if (firstGeoJson.coordinates) {
-                    if(firstGeoJson.type === 'Point') {
-                        map.panTo([firstGeoJson.coordinates[1], firstGeoJson.coordinates[0]]);
-                    } else if (firstGeoJson.type === 'Polygon') {
-                        map.fitBounds(L.geoJSON(firstGeoJson).getBounds());
-                    }
-                }
-            } else {
-                alert("Sample SPARQL query returned no results.");
-            }
-        } catch (err) {
-            alert("Error fetching data: " + err.message);
-        }
-    });
-
-    // --- Main Execution ---
-    (async () => {
-        // The initial map will now be simpler, focusing on the SPARQL client.
-        // The postal code coloring is removed to keep the focus clear.
-        console.log("Application initialized. Use the controls to run SPARQL queries.");
-    })();
+            // Fit map bounds to the data
+            map.fitBounds(geojsonLayer.getBounds());
+        })
+        .catch(error => console.error('Error loading TopoJSON data:', error));
 
 </script>
+
 </body>
 </html>
