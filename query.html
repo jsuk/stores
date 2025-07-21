@@ -15,17 +15,35 @@
 <body>
     <div class="container">
         <h1 class="mb-4">SPARQL Geo Query</h1>
-        <p class="lead">This page queries for a Japanese municipality based on a geographic point and displays its boundary on a map.</p>
+        <p class="lead">Enter coordinates to find the containing Japanese municipality, or allow location access to use your current position.</p>
         
-        <div id="query-container">
+        <div class="row g-3 align-items-center mb-3">
+            <div class="col-auto">
+                <label for="longitude" class="col-form-label">Longitude:</label>
+            </div>
+            <div class="col-auto">
+                <input type="text" id="longitude" class="form-control" value="139.48">
+            </div>
+            <div class="col-auto">
+                <label for="latitude" class="col-form-label">Latitude:</label>
+            </div>
+            <div class="col-auto">
+                <input type="text" id="latitude" class="form-control" value="35.92">
+            </div>
+            <div class="col-auto">
+                <button id="query-btn" class="btn btn-primary">Query</button>
+            </div>
+        </div>
+
+        <div id="query-container" style="display: none;">
             <h5>SPARQL Query:</h5>
             <pre><code id="query-text"></code></pre>
         </div>
 
         <div id="result-container">
             <h5>Result:</h5>
-            <div id="result" class="alert alert-info">
-                Loading...
+            <div id="result" class="alert">
+                Enter coordinates and click "Query".
             </div>
             <div id="map" style="display: none;"></div>
             <div id="debug-info" style="display: none; margin-top: 1rem;">
@@ -38,7 +56,25 @@
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
     <script src="https://unpkg.com/wellknown@0.5.0/wellknown.js"></script>
     <script type='text/javascript'>
-      const query = `
+      const lonInput = document.getElementById('longitude');
+      const latInput = document.getElementById('latitude');
+      const queryBtn = document.getElementById('query-btn');
+      
+      const queryContainer = document.getElementById('query-container');
+      const queryTextEl = document.getElementById('query-text');
+      const resultDiv = document.getElementById('result');
+      const mapDiv = document.getElementById('map');
+      const debugDiv = document.getElementById('debug-info');
+      const geojsonDebug = document.getElementById('geojson-debug');
+
+      // Keep a reference to the map instance
+      var map = null;
+
+      function executeQuery() {
+        const longitude = lonInput.value;
+        const latitude = latInput.value;
+
+        const query = `
 PREFIX rdfs:<http://www.w3.org/2000/01/rdf-schema#>
 PREFIX dcterms:<http://purl.org/dc/terms/>
 PREFIX geo: <http://www.opengis.net/ont/geosparql#>
@@ -49,90 +85,107 @@ where {
     rdfs:label ?area ;
     dcterms:isPartOf / rdfs:label ?municipality .
     ?polygon geo:asWKT ?geom .
-    FILTER (ogcf:sfContains(?geom, "POINT(139.48 35.92)"^^geo:wktLiteral)) .
+    FILTER (ogcf:sfContains(?geom, "POINT(${longitude} ${latitude})"^^geo:wktLiteral)) .
     FILTER (LANG(?municipality)='ja').
 }`;
-      const url = 'https://data.e-stat.go.jp/lod/sparql/alldata/query';
-      const resultDiv = document.getElementById('result');
-      const mapDiv = document.getElementById('map');
-      const debugDiv = document.getElementById('debug-info');
-      const geojsonDebug = document.getElementById('geojson-debug');
+        const url = 'https://data.e-stat.go.jp/lod/sparql/alldata/query';
+        
+        queryTextEl.textContent = query;
+        queryContainer.style.display = 'block';
+        resultDiv.className = 'alert alert-info';
+        resultDiv.textContent = 'Loading...';
+        
+        // Properly remove the old map instance if it exists
+        if (map) {
+            map.remove();
+            map = null;
+        }
+        mapDiv.style.display = 'none';
+        debugDiv.style.display = 'none';
+        queryBtn.disabled = true;
+
+        fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: new URLSearchParams({query: query})
+        })
+          .then(function(response) {
+              if (!response.ok) throw new Error('Network response was not ok: ' + response.statusText);
+              return response.json();
+          })
+          .then(function(data) {
+              if (data.error) throw new Error('Server error: ' + data.error);
+              if (!data.results || !data.results.bindings || data.results.bindings.length === 0) {
+                  resultDiv.className = 'alert alert-warning';
+                  resultDiv.textContent = 'No results found.';
+                  queryBtn.disabled = false;
+                  return;
+              }
+
+              var binding = data.results.bindings[0];
+              var municipality = binding.MUNICIPALITY.value;
+              var area = binding.AREA.value;
+              var wkt = binding.GEOM.value;
+
+              resultDiv.className = 'alert alert-success';
+              resultDiv.textContent = 'Municipality: ' + municipality + ', Area: ' + area;
+              
+              var match = wkt.match(/(POLYGON|MULTIPOLYGON)\s*\(\(.*\)\)/i);
+              var cleanedWkt = match ? match[0] : wkt;
+              var geojson = wellknown.parse(cleanedWkt);
+
+              if (!geojson) {
+                  debugDiv.style.display = 'block';
+                  geojsonDebug.textContent = 'Error: Could not parse WKT.\n\nOriginal: ' + wkt + '\n\nCleaned: ' + cleanedWkt;
+                  queryBtn.disabled = false;
+                  return;
+              }
+              
+              debugDiv.style.display = 'block';
+              geojsonDebug.textContent = JSON.stringify(geojson, null, 2);
+
+              mapDiv.style.display = 'block';
+              // Create the new map instance
+              map = L.map('map');
+              L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+              }).addTo(map);
+
+              var geometryLayer = L.geoJSON(geojson, { style: { color: 'red', weight: 5 } });
+              geometryLayer.addTo(map);
+
+              try {
+                  map.fitBounds(geometryLayer.getBounds());
+              } catch (e) {
+                  map.setView([latitude, longitude], 12);
+              }
+              queryBtn.disabled = false;
+          })
+          .catch(function(error) {
+              resultDiv.className = 'alert alert-danger';
+              resultDiv.innerHTML = '<strong>An error occurred:</strong><pre>' + error.toString() + '</pre>';
+              queryBtn.disabled = false;
+          });
+      }
+
+      function setInitialLocation() {
+        if ('geolocation' in navigator) {
+            navigator.geolocation.getCurrentPosition(
+                function(position) {
+                    lonInput.value = position.coords.longitude.toFixed(4);
+                    latInput.value = position.coords.latitude.toFixed(4);
+                },
+                function(error) {
+                    console.error('Could not get location. Using default values.', error);
+                }
+            );
+        }
+      }
+
+      queryBtn.addEventListener('click', executeQuery);
       
-      document.getElementById('query-text').textContent = query;
+      setInitialLocation();
 
-      fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-        body: new URLSearchParams({query: query})
-      })
-        .then(function(response) {
-            if (!response.ok) {
-                throw new Error('Network response was not ok: ' + response.statusText);
-            }
-            return response.json();
-        })
-        .then(function(data) {
-            if (data.error) {
-                throw new Error('Server error: ' + data.error);
-            }
-            if (!data.results || !data.results.bindings || data.results.bindings.length === 0) {
-                resultDiv.className = 'alert alert-warning';
-                resultDiv.textContent = 'No results found.';
-                return;
-            }
-
-            var binding = data.results.bindings[0];
-            var municipality = binding.MUNICIPALITY.value;
-            var area = binding.AREA.value;
-            var wkt = binding.GEOM.value;
-
-            resultDiv.className = 'alert alert-success';
-            resultDiv.textContent = 'Municipality: ' + municipality + ', Area: ' + area;
-            
-            debugDiv.style.display = 'block';
-            if (!wkt) {
-                geojsonDebug.textContent = 'Error: The WKT string from the API is null or empty.';
-                return;
-            }
-
-            // **Corrected Data Cleaning Step:**
-            // This regex correctly finds POLYGON or MULTIPOLYGON and their coordinates.
-            var match = wkt.match(/(POLYGON|MULTIPOLYGON)\s*\(\(.*\)\)/i);
-            var cleanedWkt = match ? match[0] : wkt;
-            
-            var geojson = wellknown.parse(cleanedWkt);
-
-            if (!geojson) {
-                geojsonDebug.textContent = 'Error: The wellknown.parse() function returned null.\n\n';
-                geojsonDebug.textContent += 'Original WKT String:\n' + wkt + '\n\n';
-                geojsonDebug.textContent += 'Cleaned WKT String (that was used for parsing):\n' + cleanedWkt;
-                return;
-            }
-
-            geojsonDebug.textContent = 'Successfully parsed GeoJSON:\n' + JSON.stringify(geojson, null, 2);
-
-            mapDiv.style.display = 'block';
-            var map = L.map('map');
-            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-            }).addTo(map);
-
-            var geometryLayer = L.geoJSON(geojson, {
-                style: { color: 'red', weight: 5 }
-            });
-            geometryLayer.addTo(map);
-
-            try {
-                map.fitBounds(geometryLayer.getBounds());
-            } catch (e) {
-                map.setView([35.92, 139.48], 12);
-            }
-        })
-        .catch(function(error) {
-            resultDiv.className = 'alert alert-danger';
-            resultDiv.innerHTML = '<strong>An error occurred:</strong><pre>' + error.toString() + '</pre>';
-            mapDiv.style.display = 'none';
-        });
     </script>
 </body>
 </html>
