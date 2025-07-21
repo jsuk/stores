@@ -148,31 +148,30 @@
                 .catch(error => {
                     log(`Failed to load or process zip file: ${error.message}. Using dummy data.`, true);
                     postalCodeData = (function() {
-                        const generatedData = new Map();
-                        let townCounter = 0;
+                        const cityCache = new Map(); // cityCode -> Map(townName -> postalCode)
 
                         return {
                             get: function(cityCode) {
-                                if (!generatedData.has(cityCode)) {
-                                    const records = [];
-                                    // Generate a few dummy records for this city
-                                    const numRecords = 1 + Math.floor(Math.random() * 3);
-                                    for (let i = 0; i < numRecords; i++) {
-                                        townCounter++;
-                                        const randomPostalCode = Math.floor(1000000 + Math.random() * 9000000).toString();
-                                        records.push({ postalCode: randomPostalCode, town: `Dummy Town ${townCounter}` });
-                                    }
-                                    // Add the special "catch-all" record to ensure a match
-                                    records.push({
-                                        postalCode: Math.floor(1000000 + Math.random() * 9000000).toString(),
-                                        town: "以下に掲載がない場合"
-                                    });
-                                    generatedData.set(cityCode, records);
+                                if (!cityCache.has(cityCode)) {
+                                    cityCache.set(cityCode, new Map());
                                 }
-                                return generatedData.get(cityCode);
+                                const townCache = cityCache.get(cityCode);
+
+                                // Return an object that can generate a postal code per town
+                                return {
+                                    getPostalCode: function(townName) {
+                                        // Also handle the fallback case, giving it a consistent code
+                                        const effectiveTown = townName || "以下に掲載がない場合";
+                                        if (!townCache.has(effectiveTown)) {
+                                            const randomPostalCode = Math.floor(1000000 + Math.random() * 9000000).toString();
+                                            townCache.set(effectiveTown, randomPostalCode);
+                                        }
+                                        return townCache.get(effectiveTown);
+                                    }
+                                };
                             },
                             set: function(key, value) { /* no-op */ },
-                            has: function(key) { return true; }
+                            has: function(key) { return true; } // The outer object always has a city
                         };
                     })();
                     log('Dummy postalCodeData object created.');
@@ -230,18 +229,26 @@
                         const props = feature.properties;
                         const cityCode = (props.KEY_CODE || '').substring(0, 5);
                         const townToFind = (props.S_NAME || '').replace(/^大字/, '');
-                        const cityRecords = postalCodeData.get(cityCode);
+                        const cityRecords = postalCodeData.get(cityCode); // For real data, this is an array. For dummy, it's an object.
+
                         if (cityRecords) {
-                            let bestMatch = null, bestMatchLength = -1;
-                            cityRecords.forEach(record => {
-                                const normalizedCsvTown = record.town.replace(/（.*/, '');
-                                if (townToFind.startsWith(normalizedCsvTown) && normalizedCsvTown.length > bestMatchLength) {
-                                    bestMatchLength = normalizedCsvTown.length;
-                                    bestMatch = record;
-                                }
-                            });
-                            if (!bestMatch) bestMatch = cityRecords.find(r => r.town === "以下に掲載がない場合");
-                            if (bestMatch) props.postalCode = bestMatch.postalCode;
+                            // Check if we are using the real data (array) or dummy data (object)
+                            if (Array.isArray(cityRecords)) {
+                                // Real data path
+                                let bestMatch = null, bestMatchLength = -1;
+                                cityRecords.forEach(record => {
+                                    const normalizedCsvTown = record.town.replace(/（.*/, '');
+                                    if (townToFind.startsWith(normalizedCsvTown) && normalizedCsvTown.length > bestMatchLength) {
+                                        bestMatchLength = normalizedCsvTown.length;
+                                        bestMatch = record;
+                                    }
+                                });
+                                if (!bestMatch) bestMatch = cityRecords.find(r => r.town === "以下に掲載がない場合");
+                                if (bestMatch) props.postalCode = bestMatch.postalCode;
+                            } else {
+                                // Dummy data path, where cityRecords is an object with getPostalCode
+                                props.postalCode = cityRecords.getPostalCode(townToFind);
+                            }
                         }
                     });
                     log('Postal codes assigned.');
