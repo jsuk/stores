@@ -97,13 +97,14 @@
 
         // 3. Styling function
         function styleFeature(feature) {
-            const color = feature.properties.postalCodeColor || '#CCCCCC';
+            const fillColor = feature.properties.postalCodeColor || '#CCCCCC';
+            const borderColor = feature.properties.cityBorderColor || 'white';
             return {
-                fillColor: color,
-                color: 'white',
-                weight: 1,
+                fillColor: fillColor,
+                color: borderColor,
+                weight: 2,
                 opacity: 1,
-                fillOpacity: 0.7
+                fillOpacity: 0.8
             };
         }
 
@@ -151,123 +152,135 @@
             if (properties) {
                 var popupContent = "<h4>Properties</h4><ul>";
                 for (var key in properties) {
-                    if (key !== 'postalCodeLookup' && key !== 'postalCodeColor') {
+                    if (!['postalCodeLookup', 'postalCodeColor', 'cityBorderColor'].includes(key)) {
                         popupContent += `<li><strong>${key}:</strong> ${properties[key]}</li>`;
                     }
                 }
-                
                 if (properties.postalCode) {
                     popupContent += `<li><strong>Postal Code:</strong> ${properties.postalCode}</li>`;
                 }
                 popupContent += "</ul>";
-
-                // --- Debug Info ---
-                if (properties.postalCodeLookup) {
-                    const lookup = properties.postalCodeLookup;
-                    popupContent += "<h4>Debug Info</h4><ul>";
-                    popupContent += `<li><strong>Lookup City Code:</strong> ${lookup.cityCode}</li>`;
-                    popupContent += `<li><strong>Original S_NAME:</strong> ${lookup.originalSName}</li>`;
-                    popupContent += `<li><strong>Normalized S_NAME:</strong> ${lookup.normalizedSName}</li>`;
-                    if (lookup.found) {
-                        popupContent += "<li><strong>Match Found:</strong> Yes</li>";
-                        popupContent += `<li><strong>Matched CSV Record:</strong> ${lookup.matchedCsvRecord}</li>`;
-                    } else {
-                        popupContent += "<li><strong>Match Found:</strong> No</li>";
-                    }
-                    popupContent += "</ul>";
-                }
-
                 layer.bindPopup(popupContent);
             }
         }
 
         // 6. Main data fetching and processing logic
-        var url = "https://geoshape.ex.nii.ac.jp/ka/topojson/2020/11/r2ka11224.topojson";
+        const urls = [
+            "https://geoshape.ex.nii.ac.jp/ka/topojson/2020/11/r2ka11224.topojson",
+            "https://geoshape.ex.nii.ac.jp/ka/topojson/2020/11/r2ka11223.topojson"
+        ];
         
         loadAndProcessCsv().then(() => {
-            log('Loading TopoJSON data...');
-            fetch(url)
-                .then(response => response.json())
-                .then(topojsonData => {
-                    log('TopoJSON data loaded. Processing geometries...');
-                    var key = Object.keys(topojsonData.objects)[0];
-                    if (!key) throw new Error('No objects found in TopoJSON file.');
+            log('Loading all TopoJSON data...');
+            const promises = urls.map(url => fetch(url).then(res => res.json()));
+            
+            Promise.all(promises)
+                .then(topojsonDatas => {
+                    log('All TopoJSON data loaded. Merging and processing geometries...');
                     
-                    var geojsonCollection = topojson.feature(topojsonData, topojsonData.objects[key]);
+                    let allFeatures = [];
+                    topojsonDatas.forEach(topojsonData => {
+                        const key = Object.keys(topojsonData.objects)[0];
+                        if (key) {
+                            const features = topojson.feature(topojsonData, topojsonData.objects[key]).features;
+                            allFeatures = allFeatures.concat(features);
+                        }
+                    });
+
+                    const geojsonCollection = { type: "FeatureCollection", features: allFeatures };
 
                     // --- Assign Postal Codes ---
                     geojsonCollection.features.forEach(feature => {
                         const props = feature.properties;
                         const cityCode = (props.KEY_CODE || '').substring(0, 5);
-                        const townToFind = props.S_NAME || '';
-                        const normalizedTownToFind = townToFind.startsWith('大字') ? townToFind.substring(2) : townToFind;
+                        const townToFind = (props.S_NAME || '').replace(/^大字/, '');
                         const cityRecords = postalCodeData.get(cityCode);
-                        
                         if (cityRecords) {
                             let bestMatch = null, bestMatchLength = -1;
                             cityRecords.forEach(record => {
                                 const normalizedCsvTown = record.town.replace(/（.*/, '');
-                                if (normalizedTownToFind.startsWith(normalizedCsvTown) && normalizedCsvTown.length > bestMatchLength) {
+                                if (townToFind.startsWith(normalizedCsvTown) && normalizedCsvTown.length > bestMatchLength) {
                                     bestMatchLength = normalizedCsvTown.length;
                                     bestMatch = record;
                                 }
                             });
                             if (!bestMatch) bestMatch = cityRecords.find(r => r.town === "以下に掲載がない場合");
-                            if (bestMatch) {
-                                props.postalCode = bestMatch.postalCode;
-                                props.postalCodeLookup = {
-                                    found: true,
-                                    cityCode: cityCode,
-                                    originalSName: townToFind,
-                                    normalizedSName: normalizedTownToFind,
-                                    matchedCsvRecord: bestMatch.originalRow
-                                };
-                            }
-                        }
-                        if (!props.postalCode) {
-                            props.postalCodeLookup = { found: false, cityCode: cityCode, originalSName: townToFind };
+                            if (bestMatch) props.postalCode = bestMatch.postalCode;
                         }
                     });
                     log('Postal codes assigned.');
 
                     // --- Build Adjacency Graph ---
                     log('Building adjacency graph...');
-                    const neighbors = new Map();
+                    const postalNeighbors = new Map();
+                    const cityNeighbors = new Map();
                     geojsonCollection.features.forEach((feature, i) => {
                         const postalCode = feature.properties.postalCode;
-                        if (!postalCode) return;
-                        if (!neighbors.has(postalCode)) neighbors.set(postalCode, new Set());
+                        const cityCode = feature.properties.CITY;
+                        if (postalCode && !postalNeighbors.has(postalCode)) postalNeighbors.set(postalCode, new Set());
+                        if (cityCode && !cityNeighbors.has(cityCode)) cityNeighbors.set(cityCode, new Set());
 
-                        const geom = feature.geometry;
-                        geojsonCollection.features.forEach((otherFeature, j) => {
-                            if (i === j) return;
+                        const bounds1 = L.geoJSON(feature.geometry).getBounds();
+                        for (let j = i + 1; j < geojsonCollection.features.length; j++) {
+                            const otherFeature = geojsonCollection.features[j];
                             const otherPostalCode = otherFeature.properties.postalCode;
-                            if (!otherPostalCode || postalCode === otherPostalCode) return;
-
-                            // Simple bounding box intersection for adjacency check
-                            const bounds1 = L.geoJSON(geom).getBounds();
+                            const otherCityCode = otherFeature.properties.CITY;
                             const bounds2 = L.geoJSON(otherFeature.geometry).getBounds();
                             if (bounds1.intersects(bounds2)) {
-                                neighbors.get(postalCode).add(otherPostalCode);
+                                if (postalCode && otherPostalCode && postalCode !== otherPostalCode) {
+                                    if (!postalNeighbors.has(otherPostalCode)) postalNeighbors.set(otherPostalCode, new Set());
+                                    postalNeighbors.get(postalCode).add(otherPostalCode);
+                                    postalNeighbors.get(otherPostalCode).add(postalCode);
+                                }
+                                if (cityCode && otherCityCode && cityCode !== otherCityCode) {
+                                    if (!cityNeighbors.has(otherCityCode)) cityNeighbors.set(otherCityCode, new Set());
+                                    cityNeighbors.get(cityCode).add(otherCityCode);
+                                    cityNeighbors.get(otherCityCode).add(cityCode);
+                                }
                             }
-                        });
+                        }
                     });
-                    log('Adjacency graph built.');
+                    log('Adjacency graphs built.');
 
-                    // --- Color Assignment ---
-                    log('Assigning colors...');
+                    // --- Hierarchical Color Assignment ---
+                    log('Assigning hierarchical colors...');
+                    const cityHues = new Map();
+                    const baseHues = [0, 40, 80, 120, 160, 200, 240, 280, 320];
+                    const cities = Array.from(cityNeighbors.keys());
+                    cities.forEach(cityCode => {
+                        const neighborHues = new Set(Array.from(cityNeighbors.get(cityCode)).map(c => cityHues.get(c)));
+                        const availableHue = baseHues.find(h => !neighborHues.has(h));
+                        cityHues.set(cityCode, availableHue !== undefined ? availableHue : Math.random() * 360);
+                    });
+
                     const postalCodeColors = new Map();
-                    const colorPalette = ['#e41a1c', '#377eb8', '#4daf4a', '#984ea3', '#ff7f00', '#ffff33', '#a65628', '#f781bf'];
-                    const postalCodes = Array.from(neighbors.keys());
-
+                    const postalCodes = Array.from(postalNeighbors.keys());
                     postalCodes.forEach(postalCode => {
-                        const neighborColors = new Set(Array.from(neighbors.get(postalCode)).map(p => postalCodeColors.get(p)));
-                        const availableColor = colorPalette.find(c => !neighborColors.has(c));
-                        postalCodeColors.set(postalCode, availableColor || '#CCCCCC');
+                        const feature = geojsonCollection.features.find(f => f.properties.postalCode === postalCode);
+                        if (!feature) return;
+                        
+                        const cityCode = feature.properties.CITY;
+                        const cityHue = cityHues.get(cityCode) || 0;
+                        
+                        const variations = [ { s: 80, l: 60 }, { s: 70, l: 50 }, { s: 90, l: 70 }, { s: 60, l: 40 }, { s: 50, l: 30 } ];
+                        const neighborColors = new Set(Array.from(postalNeighbors.get(postalCode)).map(p => postalCodeColors.get(p)));
+                        
+                        let assignedColor = '#CCCCCC';
+                        for (const v of variations) {
+                            const color = `hsl(${cityHue}, ${v.s}%, ${v.l}%)`;
+                            if (!neighborColors.has(color)) {
+                                assignedColor = color;
+                                break;
+                            }
+                        }
+                        postalCodeColors.set(postalCode, assignedColor);
                     });
 
                     geojsonCollection.features.forEach(feature => {
+                        const cityCode = feature.properties.CITY;
+                        const cityHue = cityHues.get(cityCode) || 0;
                         feature.properties.postalCodeColor = postalCodeColors.get(feature.properties.postalCode);
+                        feature.properties.cityBorderColor = `hsl(${cityHue}, 100%, 30%)`;
                     });
                     log('Colors assigned.');
 
@@ -287,6 +300,8 @@
         log(`A critical error occurred: ${e.message}`, true);
     }
 </script>
+
+
 
 </body>
 </html>
