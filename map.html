@@ -158,6 +158,7 @@
                                 const townCache = cityCache.get(cityCode);
 
                                 // Return an object that can generate a postal code per town
+                                const cityCodeForLog = cityCode;
                                 return {
                                     getPostalCode: function(townName) {
                                         // Also handle the fallback case, giving it a consistent code
@@ -165,6 +166,7 @@
                                         if (!townCache.has(effectiveTown)) {
                                             const randomPostalCode = Math.floor(1000000 + Math.random() * 9000000).toString();
                                             townCache.set(effectiveTown, randomPostalCode);
+                                            log(`DUMMY MAPPING: [City: ${cityCodeForLog}] "${effectiveTown}" -> ${randomPostalCode}`);
                                         }
                                         return townCache.get(effectiveTown);
                                     }
