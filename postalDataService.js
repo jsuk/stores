@@ -72,7 +72,14 @@ async function fetchAndCachePostalData() {
         }
         logDebug('Fetching postal data zip file...');
         // showLoading(); // This function is specific to stores.html, so remove it here
-        const response = await fetch('./zipcode/dl/roman/KEN_ALL_ROME.zip');
+	// substring of window.location.href up to the last '/'
+        const lastSlashIndex = window.location.href.lastIndexOf('/');
+	if (lastSlashIndex === -1) {
+	    throw new Error('Invalid URL: No slash found in the URL.');
+	}
+	const baseUrl = window.location.href.substring(0, lastSlashIndex + 1);
+
+        const response = await fetch(baseUrl + 'zipcode/dl/roman/KEN_ALL_ROME.zip');
         if (!response.ok) {
             throw new Error(`Failed to fetch zip file: ${response.statusText}`);
         }
