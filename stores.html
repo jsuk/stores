@@ -786,6 +786,44 @@ document.addEventListener('DOMContentLoaded', function() {
                     popupContent.appendChild(postalCodeLink);
                     popupContent.appendChild(document.createTextNode(')'));
 
+		    var makeStartForTSP = document.createElement('button');
+		    makeStartForTSP.textContent = 'Make TSP Start';
+		    makeStartForTSP.style.marginLeft = '10px';
+		    makeStartForTSP.onclick = (function(store) {
+		        return function() {
+                            const postalCode = postalCodeFilterInput.value.trim();
+                            if (postalCode && postalCode === store.postal_code) {
+                                const filteredStores = Array.from(allStores.values()).filter(s => s.postal_code === postalCode);
+			        logDebug('Making store ' + store.store_name + ' the start for TSP');
+                                const storeIndex = filteredStores.findIndex(s => s.map_store_id === store.map_store_id);
+			        logDebug(`Store index in filteredStores: ${storeIndex}`);
+                                if (storeIndex !== -1) {
+                                    const startStoreSelector = document.getElementById('startStoreSelector');
+                                    currentValue = startStoreSelector;
+				    logDebug(filteredStores[storeIndex].store_name);
+				   
+				    logDebug(startStoreSelector.options[0].text);
+				    // loop through options to find the matching store
+				    for (let i = 0; i < startStoreSelector.options.length; i++) {
+					if (startStoreSelector.options[i].text === filteredStores[storeIndex].store_name) {
+					    startStoreSelector.selectedIndex = i;
+					    logDebug(`Found matching store in selector: ${startStoreSelector.options[i].text}`);
+					    break;
+					}
+				    }
+			            // Trigger change event to update the TSP route
+			            startStoreSelector.dispatchEvent(new Event('change'));
+                                    //applyPostalFilter(postalCode);
+                                } else {
+			            logDebug(`Store ${store.store_name} not found in filteredStores.`);
+			        }
+                            }
+			};
+		    })(store);
+		    popupContent.appendChild(makeStartForTSP);
+		    popupContent.style.cursor = 'pointer';
+		
+
                     marker.bindPopup(popupContent);
                     marker.addTo(markers);
 
@@ -796,12 +834,6 @@ document.addEventListener('DOMContentLoaded', function() {
                             const postalCode = postalCodeFilterInput.value.trim();
                             if (postalCode && postalCode === store.postal_code) {
                                 const filteredStores = Array.from(allStores.values()).filter(s => s.postal_code === postalCode);
-                                const storeIndex = filteredStores.findIndex(s => s.map_store_id === store.map_store_id);
-                                if (storeIndex !== -1) {
-                                    const startStoreSelector = document.getElementById('startStoreSelector');
-                                    startStoreSelector.value = storeIndex;
-                                    applyPostalFilter(postalCode);
-                                }
                             }
                         };
                     })(store));
@@ -1618,7 +1650,5 @@ document.addEventListener('DOMContentLoaded', function() {
     initializeMapWithLocation();
 });
 </script>
-</body>
-</html>
 </body>
 </html>
