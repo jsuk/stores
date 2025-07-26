@@ -198,7 +198,14 @@ WHERE {
               // Automatically search for postal codes based on the full address from SPARQL query
               searchPostalCodesByPartialAddress(prefecture_ja, municipality_ja, area_ja).then(results => {
                   addressSearchResults.innerHTML = ''; // Clear previous results
+		  if (results.length == 0) {
+                      resultDiv.innerHTML += `<br><strong>Postal Code:</strong> Not found`;
+		  } else {
+			  resultDiv.innerHTML += `<br><strong>Postal Code ${results.length} Candidates</strong> `;
+		  }
                   if (results.length > 0) {
+		      
+
                       results.forEach(result => {
                           console.log('Result object:', result); // Add this line for debugging
                           const li = document.createElement('li');
