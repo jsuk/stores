@@ -38,11 +38,27 @@
             <div class="col-auto">
                 <button id="get-center-btn" class="btn btn-info">Get Map Center</button>
             </div>
+            <div class="col-auto">
+                <button id="clear-cache-btn" class="btn btn-danger">Clear Cache</button>
+            </div>
         </div>
 
+        <div class="row g-3 align-items-center mb-3">
+            <div class="col-auto">
+                <h5 class="mb-0">SPARQL Query:</h5>
+            </div>
+            <div class="col-auto">
+                <button id="toggle-query-btn" class="btn btn-sm btn-outline-secondary">Toggle</button>
+            </div>
+        </div>
         <div id="query-container" style="display: none;">
-            <h5>SPARQL Query:</h5>
-            <pre><code id="query-text"></code></pre>
+            <pre id="query-text-pre"><code id="query-text"></code></pre>
+        </div>
+
+        <div class="mt-4">
+            <h5>Search Postal Code by Address:</h5>
+            <input type="text" id="addressSearchInput" class="form-control" placeholder="Start typing address...">
+            <ul id="addressSearchResults" class="list-group mt-2"></ul>
         </div>
 
         <div id="result-container">
@@ -60,8 +76,11 @@
         </div>
     </div>
 
+    <script src="utils.js"></script>
     <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
     <script src="https://unpkg.com/wellknown@0.5.0/wellknown.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+    <script src="postalDataService.js"></script>
     <script type='text/javascript'>
       const lonInput = document.getElementById('longitude');
       const latInput = document.getElementById('latitude');
@@ -71,12 +90,15 @@
       
       const queryContainer = document.getElementById('query-container');
       const queryTextEl = document.getElementById('query-text');
+      const toggleQueryBtn = document.getElementById('toggle-query-btn');
       const resultDiv = document.getElementById('result');
       const mapDiv = document.getElementById('map');
       const responseContainer = document.getElementById('response-container');
       const rawResponseEl = document.getElementById('raw-response');
 
       var map = null;
+      var currentPrefectureJa = '';
+      var currentMunicipalityJa = '';
 
       function executeQuery() {
         const longitude = lonInput.value;
@@ -125,6 +147,7 @@ WHERE {
           .then(function(data) {
               responseContainer.style.display = 'block';
               rawResponseEl.textContent = JSON.stringify(data, null, 2);
+              queryTextEl.parentNode.style.display = 'none'; // Collapse SPARQL Query section after result
 
               if (data.error || !data.results || !data.results.bindings || data.results.bindings.length === 0) {
                   resultDiv.className = 'alert alert-warning';
@@ -142,6 +165,9 @@ WHERE {
               var area_en = binding.AREA_EN ? binding.AREA_EN.value : 'N/A';
               var wkt = binding.GEOM.value;
 
+              currentPrefectureJa = prefecture_ja;
+              currentMunicipalityJa = municipality_ja;
+
               resultDiv.className = 'alert alert-success';
               var full_address_ja = prefecture_ja + ' ' + municipality_ja + ' ' + area_ja;
               var full_address_en = prefecture_en + ' ' + municipality_en + ' ' + area_en;
@@ -154,6 +180,87 @@ WHERE {
                                    <strong>Area (EN):</strong> ${area_en}<br>
                                    <strong>Full Address (JA):</strong> ${full_address_ja}<br>
                                    <strong>Full Address (EN):</strong> ${full_address_en}`;
+
+              addressSearchInput.value = full_address_ja; // Update search field with full address
+
+              // Get and display postal code
+              getPostalCodeFromAddress(prefecture_ja, municipality_ja, area_ja).then(postalCode => {
+                  if (postalCode) {
+                      resultDiv.innerHTML += `<br><strong>Postal Code:</strong> ${postalCode}`;
+                  } else {
+                      resultDiv.innerHTML += `<br><strong>Postal Code:</strong> Not found`;
+                  }
+              }).catch(error => {
+                  console.error('Error getting postal code:', error);
+                  resultDiv.innerHTML += `<br><strong>Postal Code:</strong> Error retrieving`;
+              });
+
+              // Automatically search for postal codes based on the full address from SPARQL query
+              searchPostalCodesByPartialAddress(prefecture_ja, municipality_ja, area_ja).then(results => {
+                  addressSearchResults.innerHTML = ''; // Clear previous results
+                  if (results.length > 0) {
+                      results.forEach(result => {
+                          console.log('Result object:', result); // Add this line for debugging
+                          const li = document.createElement('li');
+                          li.className = 'list-group-item list-group-item-action';
+                          li.innerHTML = `
+                              <div>
+                                  ${result.postalCode}: ${result.prefecture}${result.city}${result.address}
+                                  <button class="btn btn-sm btn-outline-secondary copy-address-btn" data-address="${result.prefecture}${result.city}${result.address}">Copy JA</button>
+                              </div>
+                              <div>
+                                  ${result.postalCode}: ${result.prefecture_rome} ${result.city_rome} ${result.address_rome}
+                                  <button class="btn btn-sm btn-outline-secondary copy-address-btn" data-address="${result.prefecture_rome} ${result.city_rome} ${result.address_rome}">Copy EN</button>
+                              </div>
+                              <pre id="json-output-${result.postalCode}">${JSON.stringify(result, null, 2)}</pre> <!-- Added for debugging -->
+                              <button class="btn btn-sm btn-outline-secondary copy-json-btn" data-target-id="json-output-${result.postalCode}">Copy JSON</button>
+                          `;
+                          li.style.cursor = 'pointer';
+                          li.onclick = () => {
+                              console.log('Selected postal code from SPARQL result:', result.postalCode);
+                              addressSearchInput.value = `${result.prefecture}${result.city}${result.address}`;
+                              addressSearchResults.innerHTML = '';
+                              addressSearchInput.dispatchEvent(new Event('input')); // Trigger search
+                          };
+                          addressSearchResults.appendChild(li);
+
+                          // Add event listeners for the new copy buttons
+                          li.querySelectorAll('.copy-address-btn').forEach(button => {
+                              button.addEventListener('click', (e) => {
+                                  e.stopPropagation(); // Prevent li.onclick from firing
+                                  const addressToCopy = button.dataset.address;
+                                  navigator.clipboard.writeText(addressToCopy).then(() => {
+                                      button.textContent = 'Copied!';
+                                      setTimeout(() => { button.textContent = button.dataset.address.includes(' ') ? 'Copy EN' : 'Copy JA'; }, 2000);
+                                  }, (err) => console.error('Could not copy text: ', err));
+                              });
+                          });
+
+                          li.querySelectorAll('.copy-json-btn').forEach(button => {
+                              button.addEventListener('click', (e) => {
+                                  e.stopPropagation(); // Prevent li.onclick from firing
+                                  const targetId = button.dataset.targetId;
+                                  const jsonText = document.getElementById(targetId).textContent;
+                                  navigator.clipboard.writeText(jsonText).then(() => {
+                                      button.textContent = 'Copied!';
+                                      setTimeout(() => { button.textContent = 'Copy JSON'; }, 2000);
+                                  }, (err) => console.error('Could not copy JSON: ', err));
+                              });
+                          });
+                      });
+                  } else {
+                      const li = document.createElement('li');
+                      li.className = 'list-group-item';
+                      li.textContent = 'No postal code candidates found for this address.';
+                      addressSearchResults.appendChild(li);
+                  }
+              }).catch(error => {
+                  console.error('Error searching postal codes from SPARQL result:', error);
+                  const li = document.createElement('li');
+                  li.className = 'list-group-item';
+                  li.textContent = 'Error searching postal code candidates.';
+                  addressSearchResults.appendChild(li);
+              });
               
               // **Robust WKT Cleaning**
               var cleanedWkt = wkt.trim();
@@ -224,8 +331,60 @@ WHERE {
       queryBtn.addEventListener('click', executeQuery);
       getCenterBtn.addEventListener('click', getMapCenter);
       copyBtn.addEventListener('click', copyToClipboard);
+
+      const clearCacheBtn = document.getElementById('clear-cache-btn');
+      clearCacheBtn.addEventListener('click', async () => {
+          await clearAllCache();
+          alert('Cache cleared!');
+          // Optionally, reload the page or re-fetch data after clearing cache
+          location.reload(); 
+      });
+
+      toggleQueryBtn.addEventListener('click', () => {
+          const queryTextPre = document.getElementById('query-text-pre');
+          if (queryTextPre.style.display === 'none') {
+              queryTextPre.style.display = 'block';
+          } else {
+              queryTextPre.style.display = 'none';
+          }
+      });
       
       setInitialLocation();
+
+      // Fetch and cache postal data when the page loads
+      fetchAndCachePostalData();
+
+      const addressSearchInput = document.getElementById('addressSearchInput');
+      const addressSearchResults = document.getElementById('addressSearchResults');
+
+      addressSearchInput.addEventListener('input', async (event) => {
+          const searchTerm = event.target.value.trim();
+          addressSearchResults.innerHTML = ''; // Clear previous results
+
+          if (searchTerm.length > 0) { // Search as soon as user types
+              const results = await searchPostalCodesByPartialAddress(currentPrefectureJa, currentMunicipalityJa, searchTerm);
+              if (results.length > 0) {
+                  results.forEach(result => {
+                      const li = document.createElement('li');
+                      li.className = 'list-group-item list-group-item-action';
+                      li.textContent = `${result.postalCode}: ${result.prefecture}${result.city}${result.address}`;
+                      li.style.cursor = 'pointer';
+                      li.onclick = () => {
+                          console.log('Selected postal code from manual search:', result.postalCode);
+                          addressSearchInput.value = `${result.prefecture}${result.city}${result.address}`;
+                          addressSearchResults.innerHTML = ''; // Clear results after selection
+                          addressSearchInput.dispatchEvent(new Event('input')); // Trigger search
+                      };
+                      addressSearchResults.appendChild(li);
+                  });
+              } else {
+                  const li = document.createElement('li');
+                  li.className = 'list-group-item';
+                  li.textContent = 'No results found.';
+                  addressSearchResults.appendChild(li);
+              }
+          }
+      });
 
     </script>
 </body>
