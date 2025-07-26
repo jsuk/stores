@@ -72,7 +72,7 @@ async function fetchAndCachePostalData() {
         }
         logDebug('Fetching postal data zip file...');
         // showLoading(); // This function is specific to stores.html, so remove it here
-        const response = await fetch('http://localhost:8080/zipcode/dl/roman/KEN_ALL_ROME.zip');
+        const response = await fetch('./zipcode/dl/roman/KEN_ALL_ROME.zip');
         if (!response.ok) {
             throw new Error(`Failed to fetch zip file: ${response.statusText}`);
         }
