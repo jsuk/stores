@@ -87,7 +87,7 @@ PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
 PREFIX dcterms: <http://purl.org/dc/terms/>
 PREFIX geo: <http://www.opengis.net/ont/geosparql#>
 PREFIX ogcf: <http://www.opengis.net/def/function/geosparql/>
-SELECT ?municipality_ja ?municipality_en ?area_ja ?area_en ?geom
+SELECT ?prefecture_ja ?prefecture_en ?municipality_ja ?municipality_en ?area_ja ?area_en ?geom
 WHERE {
     ?area_entity geo:hasGeometry/geo:asWKT ?geom .
     FILTER(ogcf:sfContains(?geom, "POINT(${longitude} ${latitude})"^^geo:wktLiteral)) .
@@ -98,6 +98,10 @@ WHERE {
     ?municipality_entity rdfs:label ?municipality_ja .
     FILTER(LANG(?municipality_ja) = 'ja') .
     OPTIONAL { ?municipality_entity rdfs:label ?municipality_en . FILTER(LANG(?municipality_en) = 'en') . }
+    ?municipality_entity dcterms:isPartOf ?prefecture_entity .
+    ?prefecture_entity rdfs:label ?prefecture_ja .
+    FILTER(LANG(?prefecture_ja) = 'ja') .
+    OPTIONAL { ?prefecture_entity rdfs:label ?prefecture_en . FILTER(LANG(?prefecture_en) = 'en') . }
 }`;
         const url = 'https://data.e-stat.go.jp/lod/sparql/alldata/query';
         
@@ -130,6 +134,8 @@ WHERE {
               }
 
               var binding = data.results.bindings[0];
+              var prefecture_ja = binding.PREFECTURE_JA ? binding.PREFECTURE_JA.value : 'N/A';
+              var prefecture_en = binding.PREFECTURE_EN ? binding.PREFECTURE_EN.value : 'N/A';
               var municipality_ja = binding.MUNICIPALITY_JA.value;
               var area_ja = binding.AREA_JA.value;
               var municipality_en = binding.MUNICIPALITY_EN ? binding.MUNICIPALITY_EN.value : 'N/A';
@@ -137,10 +143,17 @@ WHERE {
               var wkt = binding.GEOM.value;
 
               resultDiv.className = 'alert alert-success';
-              resultDiv.innerHTML = `<strong>Municipality (JA):</strong> ${municipality_ja}<br>
+              var full_address_ja = prefecture_ja + ' ' + municipality_ja + ' ' + area_ja;
+              var full_address_en = prefecture_en + ' ' + municipality_en + ' ' + area_en;
+
+              resultDiv.innerHTML = `<strong>Prefecture (JA):</strong> ${prefecture_ja}<br>
+                                   <strong>Prefecture (EN):</strong> ${prefecture_en}<br>
+                                   <strong>Municipality (JA):</strong> ${municipality_ja}<br>
                                    <strong>Municipality (EN):</strong> ${municipality_en}<br>
                                    <strong>Area (JA):</strong> ${area_ja}<br>
-                                   <strong>Area (EN):</strong> ${area_en}`;
+                                   <strong>Area (EN):</strong> ${area_en}<br>
+                                   <strong>Full Address (JA):</strong> ${full_address_ja}<br>
+                                   <strong>Full Address (EN):</strong> ${full_address_en}`;
               
               // **Robust WKT Cleaning**
               var cleanedWkt = wkt.trim();
