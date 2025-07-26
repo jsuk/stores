@@ -135,6 +135,8 @@ async function fetchAndCachePostalData() {
 
 async function clearAllCache() {
     // Clear IndexedDB
+    // Clear cacheTimestamp as well
+    localStorage.removeItem('postal_data_ken_all_rome_timestamp');
     return new Promise((resolve, reject) => {
         const request = indexedDB.deleteDatabase(dbName);
         request.onsuccess = () => {
