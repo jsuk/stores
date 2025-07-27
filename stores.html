@@ -123,15 +123,22 @@
 <script>
     // IndexedDB helper functions
     const dbName = 'PostalDataDB';
-    const storeName = 'postalCodes';
+    const postalStoreName = 'postalCodes';
+    const kvStoreName = 'keyValueStore';
 
     function openDB() {
         return new Promise((resolve, reject) => {
-            const request = indexedDB.open(dbName, 1);
+            const request = indexedDB.open(dbName, 2); // Version bumped to 2
             request.onupgradeneeded = (event) => {
                 const db = event.target.result;
-                if (!db.objectStoreNames.contains(storeName)) {
-                    db.createObjectStore(storeName, { keyPath: 'postalCode' });
+                logDebug('Upgrading IndexedDB...');
+                if (!db.objectStoreNames.contains(postalStoreName)) {
+                    db.createObjectStore(postalStoreName, { keyPath: 'postalCode' });
+                    logDebug(`Object store '${postalStoreName}' created.`);
+                }
+                if (!db.objectStoreNames.contains(kvStoreName)) {
+                    db.createObjectStore(kvStoreName, { keyPath: 'key' });
+                    logDebug(`Object store '${kvStoreName}' created.`);
                 }
             };
             request.onsuccess = (event) => {
@@ -143,10 +150,63 @@
         });
     }
 
+    async function setItemToDB(key, value) {
+        const db = await openDB();
+        const transaction = db.transaction(kvStoreName, 'readwrite');
+        const store = transaction.objectStore(kvStoreName);
+        store.put({ key, value });
+        return transaction.complete;
+    }
+
+    async function getItemFromDB(key) {
+        const db = await openDB();
+        const transaction = db.transaction(kvStoreName, 'readonly');
+        const store = transaction.objectStore(kvStoreName);
+        const record = await new Promise((resolve, reject) => {
+            const request = store.get(key);
+            request.onsuccess = () => resolve(request.result);
+            request.onerror = () => reject(request.error);
+        });
+        return record ? record.value : null;
+    }
+
+    async function removeItemFromDB(key) {
+        const db = await openDB();
+        const transaction = db.transaction(kvStoreName, 'readwrite');
+        const store = transaction.objectStore(kvStoreName);
+        store.delete(key);
+        return transaction.complete;
+    }
+    
+    async function clearItemsFromDBWithPrefix(prefix) {
+        const db = await openDB();
+        const transaction = db.transaction(kvStoreName, 'readwrite');
+        const store = transaction.objectStore(kvStoreName);
+        const request = store.openCursor();
+        await new Promise((resolve, reject) => {
+            transaction.oncomplete = () => {
+                logDebug(`Cleared items with prefix '${prefix}' from '${kvStoreName}'.`);
+                resolve();
+            };
+            transaction.onerror = (event) => {
+                reject(event.target.error);
+            };
+            request.onsuccess = event => {
+                const cursor = event.target.result;
+                if (cursor) {
+                    if (String(cursor.key).startsWith(prefix)) {
+                        cursor.delete();
+                    }
+                    cursor.continue();
+                }
+            };
+        });
+    }
+
     async function saveDataToDB(data) {
         const db = await openDB();
-        const transaction = db.transaction(storeName, 'readwrite');
-        const store = transaction.objectStore(storeName);
+        const transaction = db.transaction(postalStoreName, 'readwrite');
+        const store = transaction.objectStore(postalStoreName);
         Object.keys(data).forEach(postalCode => {
             store.put({ postalCode, data: data[postalCode] });
         });
@@ -161,8 +221,8 @@
             return postalCodeAddressCache;
         }
         const db = await openDB();
-        const transaction = db.transaction(storeName, 'readonly');
-        const store = transaction.objectStore(storeName);
+        const transaction = db.transaction(postalStoreName, 'readonly');
+        const store = transaction.objectStore(postalStoreName);
         const allRecords = await new Promise((resolve, reject) => {
             const request = store.getAll();
             request.onsuccess = () => resolve(request.result);
@@ -182,7 +242,7 @@
         const cacheTimestampKey = 'postal_data_ken_all_rome_timestamp';
         const cacheDuration = 24 * 60 * 60 * 1000; // 24 hours
 
-        const cachedTimestamp = localStorage.getItem(cacheTimestampKey);
+        const cachedTimestamp = await getItemFromDB(cacheTimestampKey);
 
         if (cachedTimestamp && (new Date().getTime() - cachedTimestamp < cacheDuration)) {
             logDebug('Using cached postal data from IndexedDB.');
@@ -195,7 +255,13 @@
             }
             logDebug('Fetching postal data zip file...');
             showLoading();
-            const response = await fetch('http://localhost:8080/zipcode/dl/roman/KEN_ALL_ROME.zip');
+            // substring of window.location.href up to the last '/'
+	    const lastSlashIndex = window.location.href.lastIndexOf('/');
+	    if (lastSlashIndex === -1) {
+	throw new Error('Invalid URL: No slash found in the URL.');
+	}
+	const baseUrl = window.location.href.substring(0, lastSlashIndex + 1);
+	       const response = await fetch(baseUrl + 'zipcode/dl/roman/KEN_ALL_ROME.zip');
             if (!response.ok) {
                 throw new Error(`Failed to fetch zip file: ${response.statusText}`);
             }
@@ -234,7 +300,7 @@
 
             logDebug('Parsing complete. Caching data to IndexedDB...');
             await saveDataToDB(postalData);
-            localStorage.setItem(cacheTimestampKey, new Date().getTime());
+            await setItemToDB(cacheTimestampKey, new Date().getTime());
             logDebug('Postal data cached successfully in IndexedDB.');
             return postalData; // Return newly fetched data
         } catch (error) {
@@ -326,6 +392,7 @@ document.addEventListener('DOMContentLoaded', function() {
 	"いちげん", "いちげん",
 	"BOOKOFF", "BOOKOFF",
 	"ニッポンレンタカー", "ﾆｯﾎﾟﾝﾚﾝﾀｶｰ",
+	"スギドラッグ", "ｽｷﾞﾄﾞﾗｯｸﾞ",
 	"ビーンズ", "ﾋﾞｰﾝｽﾞ",
 	"AOKI", "AOKI",
 	"ユニクロ", "ﾕﾆｸﾛ",
@@ -620,48 +687,45 @@ document.addEventListener('DOMContentLoaded', function() {
     const STORE_DETAIL_CACHE_KEY_PREFIX = 'store_detail_';
     const STORE_DETAIL_CACHE_EXPIRATION_TIME = 24 * 60 * 60 * 1000; // 24 hours for individual store details
 
-    function fetchAndCacheStoreDetail(store) {
+    async function fetchAndCacheStoreDetail(store) {
         const individualStoreCacheKey = STORE_DETAIL_CACHE_KEY_PREFIX + store.map_store_id;
-        const cachedStoreDetail = localStorage.getItem(individualStoreCacheKey);
+        const cachedStoreDetail = await getItemFromDB(individualStoreCacheKey);
 
         if (cachedStoreDetail) {
-            const { timestamp, data } = JSON.parse(cachedStoreDetail);
+            const { timestamp, data } = cachedStoreDetail;
             const now = new Date().getTime();
 
             if (now - timestamp < STORE_DETAIL_CACHE_EXPIRATION_TIME) {
                 logDebug(`Using cached detail for store ${store.map_store_id}`);
                 Object.assign(store, data); // Merge all cached data
-                return Promise.resolve(store);
+                return store;
             } else {
                 logDebug(`Cached detail for store ${store.map_store_id} expired.`);
-                localStorage.removeItem(individualStoreCacheKey); // Clear expired cache
+                await removeItemFromDB(individualStoreCacheKey); // Clear expired cache
             }
         }
 
         const storeDetailUrl = `/mmeu/api/v3/store/${store.map_store_id}?client_id=integrated`;
-        return fetch(storeDetailUrl)
-            .then(response => {
-                if (!response.ok) {
-                    throw new Error(`Failed to fetch details for store ${store.map_store_id}`);
-                }
-                return response.json();
-            })
-            .then(detailData => {
-                Object.assign(store, detailData); // Merge all fetched data
-                // Cache individual store detail
-                const cacheData = {
-                    timestamp: new Date().getTime(),
-                    data: detailData
-                };
-                localStorage.setItem(individualStoreCacheKey, JSON.stringify(cacheData));
-                logDebug(`Detail for store ${store.map_store_id} cached.`);
-                return store;
-            })
-            .catch(error => {
-                logDebug(`Error fetching detail for store ${store.map_store_id}: ${error}`);
-                console.error(`Error fetching detail for store ${store.map_store_id}:`, error);
-                return store; // Return original store even if detail fetch fails
-            });
+        try {
+            const response = await fetch(storeDetailUrl);
+            if (!response.ok) {
+                throw new Error(`Failed to fetch details for store ${store.map_store_id}`);
+            }
+            const detailData = await response.json();
+            Object.assign(store, detailData); // Merge all fetched data
+            // Cache individual store detail
+            const cacheData = {
+                timestamp: new Date().getTime(),
+                data: detailData
+            };
+            await setItemToDB(individualStoreCacheKey, cacheData);
+            logDebug(`Detail for store ${store.map_store_id} cached.`);
+            return store;
+        } catch (error) {
+            logDebug(`Error fetching detail for store ${store.map_store_id}: ${error}`);
+            console.error(`Error fetching detail for store ${store.map_store_id}:`, error);
+            return store; // Return original store even if detail fetch fails
+        }
     }
 
     function getTextColorForBg(bgColor) {
@@ -984,100 +1048,87 @@ document.addEventListener('DOMContentLoaded', function() {
     const CACHE_KEY = 'stores_data';
     const CACHE_EXPIRATION_TIME = 60 * 60 * 1000; // 1 hour in milliseconds
 
-    function fetchAndCacheStores(isIncremental = false) {
+    async function fetchAndCacheStores(isIncremental = false) {
         logDebug('Attempting to fetch and cache stores...');
         showLoading();
-        fetch(apiUrl)
-            .then(response => {
-                logDebug(`API response status: ${response.status}`);
-                if (!response.ok) {
-                    throw new Error(`Network response was not ok: ${response.statusText}`);
-                }
-                return response.json();
-            })
-            .then(data => {
-                logDebug(`API data received. Store count: ${data.stores ? data.stores.length : 0}`);
-                if (data.stores && Array.isArray(data.stores)) {
-                    let newStores = [];
-                    if (isIncremental) {
-                        data.stores.forEach(store => {
-                            if (!allStores.has(store.map_store_id)) {
-                                allStores.set(store.map_store_id, store);
-                                newStores.push(store);
-                            }
-                        });
-                        logDebug(`Found ${newStores.length} new stores to add.`);
-                    } else {
-                        allStores.clear();
-                        data.stores.forEach(store => allStores.set(store.map_store_id, store));
-                        newStores = data.stores;
-                        logDebug('Reloading all stores.');
-                    }
-
-                    const storesToProcess = newStores.length > 0 ? newStores : Array.from(allStores.values());
-
-                    const fetchPostalCodes = storesToProcess.map(store => fetchAndCacheStoreDetail(store));
-
-                    Promise.all(fetchPostalCodes)
-                        .then((processedStores) => {
-                            logDebug('All details fetched. Rendering stores...');
-                            
-                            // Update the main cache with all stores
-                            const cacheData = {
-                                timestamp: new Date().getTime(),
-                                data: Array.from(allStores.values()) // Convert Map to array for JSON
-                            };
-                            localStorage.setItem(CACHE_KEY, JSON.stringify(cacheData));
-                            logDebug('Main store cache updated.');
-
-                            if (map) {
-                                try {
-                                    renderStores(Array.from(allStores.values()));
-                                } catch (renderError) {
-                                    logDebug(`Error during renderStores: ${renderError}`);
-                                    console.error('Error during renderStores:', renderError);
-                                }
-                            }
-                        })
-                        .catch(error => {
-                            logDebug(`Error in Promise.all for postal codes: ${error}`);
-                            console.error(`Error in Promise.all for postal codes:`, error);
-                            if (map) {
-                                renderStores(Array.from(allStores.values()));
-                            }
-                        })
-                        .finally(() => {
-                            hideLoading();
-                        });
-
+        try {
+            const response = await fetch(apiUrl);
+            logDebug(`API response status: ${response.status}`);
+            if (!response.ok) {
+                throw new Error(`Network response was not ok: ${response.statusText}`);
+            }
+            const data = await response.json();
+            logDebug(`API data received. Store count: ${data.stores ? data.stores.length : 0}`);
+            if (data.stores && Array.isArray(data.stores)) {
+                let newStores = [];
+                if (isIncremental) {
+                    data.stores.forEach(store => {
+                        if (!allStores.has(store.map_store_id)) {
+                            allStores.set(store.map_store_id, store);
+                            newStores.push(store);
+                        }
+                    });
+                    logDebug(`Found ${newStores.length} new stores to add.`);
                 } else {
-                    logDebug('API response did not contain a valid "stores" array.');
-                    hideLoading();
+                    allStores.clear();
+                    data.stores.forEach(store => allStores.set(store.map_store_id, store));
+                    newStores = data.stores;
+                    logDebug('Reloading all stores.');
                 }
-            })
-            .catch(error => {
-                logDebug(`Error fetching from API: ${error}`);
-                console.error('Error:', error);
-                hideLoading();
-            });
+
+                const storesToProcess = newStores.length > 0 ? newStores : Array.from(allStores.values());
+
+                try {
+                    await Promise.all(storesToProcess.map(store => fetchAndCacheStoreDetail(store)));
+                    logDebug('All details fetched. Rendering stores...');
+                    
+                    // Update the main cache with all stores
+                    const cacheData = {
+                        timestamp: new Date().getTime(),
+                        data: Array.from(allStores.values()) // Convert Map to array for JSON
+                    };
+                    await setItemToDB(CACHE_KEY, cacheData);
+                    logDebug('Main store cache updated.');
+
+                    if (map) {
+                        try {
+                            renderStores(Array.from(allStores.values()));
+                        } catch (renderError) {
+                            logDebug(`Error during renderStores: ${renderError}`);
+                            console.error('Error during renderStores:', renderError);
+                        }
+                    }
+                } catch (error) {
+                    logDebug(`Error in Promise.all for postal codes: ${error}`);
+                    console.error(`Error in Promise.all for postal codes:`, error);
+                    if (map) {
+                        renderStores(Array.from(allStores.values()));
+                    }
+                }
+
+            } else {
+                logDebug('API response did not contain a valid "stores" array.');
+            }
+        } catch (error) {
+            logDebug(`Error fetching from API: ${error}`);
+            console.error('Error:', error);
+        } finally {
+            hideLoading();
+        }
     }
 
-    function forceReloadAllStores() {
+    async function forceReloadAllStores() {
         logDebug('Forcing reload of all store data...');
         allStores.clear();
         // Clear all individual store detail caches
-        Object.keys(localStorage).forEach(key => {
-            if (key.startsWith(STORE_DETAIL_CACHE_KEY_PREFIX)) {
-                localStorage.removeItem(key);
-            }
-        });
+        await clearItemsFromDBWithPrefix(STORE_DETAIL_CACHE_KEY_PREFIX);
         logDebug('All individual store detail caches cleared.');
 
         // Re-fetch everything
-        fetchAndCacheStores(false);
+        await fetchAndCacheStores(false);
     }
 
-    function initializeMapWithLocation() {
+    async function initializeMapWithLocation() {
         logDebug('Initializing map...');
         const mapElement = document.getElementById('map');
         if (mapElement) {
@@ -1112,9 +1163,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 }
             }, {
                 text: 'Force Reload All Store Data',
-                callback: () => {
-                    forceReloadAllStores();
-                }
+                callback: forceReloadAllStores
             }, {
                 text: 'Fetch stores from this location',
                 callback: (e) => {
@@ -1193,61 +1242,42 @@ document.addEventListener('DOMContentLoaded', function() {
         addTopoJsonLayer('https://geoshape.ex.nii.ac.jp/ka/topojson/2020/13/r2ka13117.topojson', 'purple');
         addTopoJsonLayer('https://geoshape.ex.nii.ac.jp/ka/topojson/2020/11/r2ka11223.topojson', 'blue');
 
+        const loadInitialStores = async () => {
+            const cachedData = await getItemFromDB(CACHE_KEY);
+            if (cachedData) {
+                const { timestamp, data } = cachedData;
+                const now = new Date().getTime();
+                if (now - timestamp < CACHE_EXPIRATION_TIME) {
+                    logDebug('Loading stores from cache.');
+                    data.forEach(store => allStores.set(store.map_store_id, store));
+                    renderStores(Array.from(allStores.values()));
+                    hideLoading();
+                    return; // Exit if we loaded from cache
+                } else {
+                    logDebug('Cached data expired.');
+                    await removeItemFromDB(CACHE_KEY);
+                }
+            }
+            await fetchAndCacheStores(false);
+        };
+
         if (navigator.geolocation) {
             logDebug('Attempting to get current location for initial view...');
-            navigator.geolocation.getCurrentPosition(function(position) {
+            navigator.geolocation.getCurrentPosition(async (position) => {
                 var lat = position.coords.latitude;
                 var lon = position.coords.longitude;
                 map.setView([lat, lon], 13);
                 logDebug(`Map centered on current location: Lat ${lat}, Lng ${lon}`);
-                map.whenReady(function() {
-                    logDebug('Map ready event fired.');
-		    const cachedData = localStorage.getItem(CACHE_KEY);
-		    if (cachedData) {
-		        const { timestamp, data } = JSON.parse(cachedData);
-		    	const now = new Date().getTime();
-		    	if (now - timestamp < CACHE_EXPIRATION_TIME) {
-		    		logDebug('Loading stores from cache.');
-		    		data.forEach(store => allStores.set(store.map_store_id, store));
-		    		renderStores(Array.from(allStores.values()));
-		    		hideLoading();
-		    		return; // Exit if we loaded from cache
-		    	} else {
-		    	        logDebug('Cached data expired.');
-		    		localStorage.removeItem(CACHE_KEY);
-		    	}
-		    }
-                    fetchAndCacheStores(false);
-                });
-            }, function(error) {
+                map.whenReady(loadInitialStores);
+            }, async (error) => {
                 logDebug(`Error getting location: ${error.message}. Falling back to default view.`);
                 map.setView([35.681236, 139.767125], 13); // Default view
-                map.whenReady(function() {
-                    logDebug('Map ready event fired.');
-		    if (cachedData) {
-		        const { timestamp, data } = JSON.parse(cachedData);
-		    	const now = new Date().getTime();
-		    	if (now - timestamp < CACHE_EXPIRATION_TIME) {
-		    		logDebug('Loading stores from cache.');
-		    		data.forEach(store => allStores.set(store.map_store_id, store));
-		    		renderStores(Array.from(allStores.values()));
-		    		hideLoading();
-		    		return; // Exit if we loaded from cache
-		    	} else {
-		    	        logDebug('Cached data expired.');
-		    		localStorage.removeItem(CACHE_KEY);
-		    	}
-		    }
-                    fetchAndCacheStores(false);
-                });
+                map.whenReady(loadInitialStores);
             });
         } else {
             logDebug('Geolocation is not supported by this browser. Using default view.');
             map.setView([35.681236, 139.767125], 13); // Default view
-            map.whenReady(function() {
-                logDebug('Map ready event fired.');
-                fetchAndCacheStores(false);
-            });
+            map.whenReady(loadInitialStores);
         }
     }
 
@@ -1395,7 +1425,7 @@ document.addEventListener('DOMContentLoaded', function() {
             if (filteredStores.length > 1) {
                 // Populate start store selector
                 startStoreSelector.innerHTML = ''; // Clear previous options
-                const savedSelection = localStorage.getItem('startStore-' + postalCode);
+                const savedSelection = await getItemFromDB('startStore-' + postalCode);
                 filteredStores.forEach((store, index) => {
                     const option = document.createElement('option');
                     option.value = index;
@@ -1587,10 +1617,10 @@ document.addEventListener('DOMContentLoaded', function() {
     });
 
     // Event listener for start store selector
-    document.getElementById('startStoreSelector').addEventListener('change', function() {
+    document.getElementById('startStoreSelector').addEventListener('change', async function() {
         var filterPostalCode = postalCodeFilterInput.value.trim();
         if (filterPostalCode) {
-            localStorage.setItem('startStore-' + filterPostalCode, this.value);
+            await setItemToDB('startStore-' + filterPostalCode, this.value);
             applyPostalFilter(filterPostalCode);
         }
     });
@@ -1629,10 +1659,14 @@ document.addEventListener('DOMContentLoaded', function() {
     document.getElementById('clearPostalCache').addEventListener('click', async function() {
         try {
             const db = await openDB();
-            const transaction = db.transaction(storeName, 'readwrite');
-            const store = transaction.objectStore(storeName);
-            await store.clear();
-            localStorage.removeItem('postal_data_ken_all_rome_timestamp');
+            const transaction = db.transaction(postalStoreName, 'readwrite');
+            const store = transaction.objectStore(postalStoreName);
+            await new Promise((resolve, reject) => {
+                const request = store.clear();
+                request.onsuccess = resolve;
+                request.onerror = reject;
+            });
+            await removeItemFromDB('postal_data_ken_all_rome_timestamp');
             postalCodeAddressCache = null; // Invalidate the in-memory cache
             logDebug('Postal code cache cleared.');
             alert('Postal code cache has been cleared.');

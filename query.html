@@ -184,16 +184,16 @@ WHERE {
               addressSearchInput.value = full_address_ja; // Update search field with full address
 
               // Get and display postal code
-              getPostalCodeFromAddress(prefecture_ja, municipality_ja, area_ja).then(postalCode => {
-                  if (postalCode) {
-                      resultDiv.innerHTML += `<br><strong>Postal Code:</strong> ${postalCode}`;
-                  } else {
-                      resultDiv.innerHTML += `<br><strong>Postal Code:</strong> Not found`;
-                  }
-              }).catch(error => {
-                  console.error('Error getting postal code:', error);
-                  resultDiv.innerHTML += `<br><strong>Postal Code:</strong> Error retrieving`;
-              });
+              //getPostalCodeFromAddress(prefecture_ja, municipality_ja, area_ja).then(postalCode => {
+              //    if (postalCode) {
+              //        resultDiv.innerHTML += `<br><strong>Postal Code:</strong> ${postalCode}`;
+              //    } else {
+              //        resultDiv.innerHTML += `<br><strong>Postal Code:</strong> Not found`;
+              //    }
+              //}).catch(error => {
+              //    console.error('Error getting postal code:', error);
+              //    resultDiv.innerHTML += `<br><strong>Postal Code:</strong> Error retrieving`;
+              //});
 
               // Automatically search for postal codes based on the full address from SPARQL query
               searchPostalCodesByPartialAddress(prefecture_ja, municipality_ja, area_ja).then(results => {

@@ -113,7 +113,12 @@
 
         // 4. CSV parser and data loader
         function loadAndProcessCsv() {
-            const zipUrl = '/zipcode/dl/utf/zip/utf_ken_all.zip';
+        const lastSlashIndex = window.location.href.lastIndexOf('/');
+        if (lastSlashIndex === -1) {
+    throw new Error('Invalid URL: No slash found in the URL.');
+    }
+    const baseUrl = window.location.href.substring(0, lastSlashIndex + 1);
+            const zipUrl = baseUrl + 'zipcode/dl/utf/zip/utf_ken_all.zip';
             log(`Fetching ZIP data from: ${zipUrl}`);
             return fetch(zipUrl)
                 .then(response => {
