@@ -100,212 +100,454 @@
       var currentPrefectureJa = '';
       var currentMunicipalityJa = '';
 
-      function executeQuery() {
+      let cachedResults = new Map(); // Simple in-memory cache
+
+      async function executeQuery() {
         const longitude = lonInput.value;
         const latitude = latInput.value;
+        const cacheKey = `${longitude},${latitude}`;
 
-        const query = `
-PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
-PREFIX dcterms: <http://purl.org/dc/terms/>
-PREFIX geo: <http://www.opengis.net/ont/geosparql#>
-PREFIX ogcf: <http://www.opengis.net/def/function/geosparql/>
-SELECT ?prefecture_ja ?prefecture_en ?municipality_ja ?municipality_en ?area_ja ?area_en ?geom
-WHERE {
-    ?area_entity geo:hasGeometry/geo:asWKT ?geom .
-    FILTER(ogcf:sfContains(?geom, "POINT(${longitude} ${latitude})"^^geo:wktLiteral)) .
-    ?area_entity rdfs:label ?area_ja .
-    FILTER(LANG(?area_ja) = 'ja') .
-    OPTIONAL { ?area_entity rdfs:label ?area_en . FILTER(LANG(?area_en) = 'en') . }
-    ?area_entity dcterms:isPartOf ?municipality_entity .
-    ?municipality_entity rdfs:label ?municipality_ja .
-    FILTER(LANG(?municipality_ja) = 'ja') .
-    OPTIONAL { ?municipality_entity rdfs:label ?municipality_en . FILTER(LANG(?municipality_en) = 'en') . }
-    ?municipality_entity dcterms:isPartOf ?prefecture_entity .
-    ?prefecture_entity rdfs:label ?prefecture_ja .
-    FILTER(LANG(?prefecture_ja) = 'ja') .
-    OPTIONAL { ?prefecture_entity rdfs:label ?prefecture_en . FILTER(LANG(?prefecture_en) = 'en') . }
-}`;
-        const url = 'https://data.e-stat.go.jp/lod/sparql/alldata/query';
-        
-        queryTextEl.textContent = query;
-        queryContainer.style.display = 'block';
-        resultDiv.className = 'alert alert-info';
-        resultDiv.textContent = 'Loading...';
-        
+        // Check cache first
+        if (cachedResults.has(cacheKey)) {
+          const cachedData = cachedResults.get(cacheKey);
+          displayResults(cachedData);
+          return;
+        }
+
+        // Initialize UI
         if (map) { map.remove(); map = null; }
         mapDiv.style.display = 'none';
         responseContainer.style.display = 'none';
         queryBtn.disabled = true;
         getCenterBtn.disabled = true;
+        addressSearchResults.innerHTML = '';
 
-        fetch(url, {
+        // STAGE 1: Get geometry only (fastest - immediate map display)
+        const geometryQuery = `
+PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+PREFIX ogcf: <http://www.opengis.net/def/function/geosparql/>
+SELECT ?geom ?area_entity
+WHERE {
+    ?area_entity geo:hasGeometry/geo:asWKT ?geom .
+    FILTER(ogcf:sfContains(?geom, "POINT(${longitude} ${latitude})"^^geo:wktLiteral)) .
+    FILTER(STRSTARTS(STR(?area_entity), "http://data.e-stat.go.jp/lod/smallArea"))
+}`;
+
+        queryTextEl.textContent = geometryQuery;
+        queryContainer.style.display = 'block';
+        resultDiv.className = 'alert alert-info';
+        resultDiv.innerHTML = '<strong>Stage 1/3:</strong> Loading map geometry...';
+
+        const url = 'https://data.e-stat.go.jp/lod/sparql/alldata/query';
+
+        try {
+          // Stage 1: Geometry
+          const geometryResponse = await fetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+            body: new URLSearchParams({query: geometryQuery})
+          });
+          
+          const geometryData = await geometryResponse.json();
+          
+          if (geometryData.error || !geometryData.results || !geometryData.results.bindings || geometryData.results.bindings.length === 0) {
+            resultDiv.className = 'alert alert-warning';
+            resultDiv.textContent = 'No results found or server returned an error.';
+            queryBtn.disabled = false;
+            getCenterBtn.disabled = false;
+            return;
+          }
+
+          const geoBinding = geometryData.results.bindings[0];
+          const resultData = {
+            geom: geoBinding.GEOM.value,
+            area_entity: geoBinding.AREA_ENTITY ? geoBinding.AREA_ENTITY.value : null,
+            prefecture_ja: 'Loading...',
+            municipality_ja: 'Loading...',
+            area_ja: 'Loading...',
+            prefecture_en: 'Loading...',
+            municipality_en: 'Loading...',
+            area_en: 'Loading...'
+          };
+
+          // Display map immediately
+          displayMapOnly(resultData.geom);
+          responseContainer.style.display = 'block';
+          rawResponseEl.textContent = JSON.stringify(geometryData, null, 2);
+
+          resultDiv.innerHTML = '<strong>Stage 2/3:</strong> Loading Japanese names...';
+
+          // STAGE 2: Japanese locale strings
+          fetchJapaneseNames(resultData.area_entity).then(japaneseData => {
+            console.log('Japanese data response:', japaneseData);
+            if (japaneseData) {
+              Object.assign(resultData, japaneseData);
+              displayResults(resultData);
+              
+              resultDiv.innerHTML = resultDiv.innerHTML.replace('Stage 2/3', 'Stage 3/3').replace('Loading Japanese names...', 'Loading English translations...');
+
+              // STAGE 3: English locale strings (background)
+              fetchEnglishTranslations(resultData).then(englishData => {
+                console.log('English data response:', englishData);
+                if (englishData) {
+                  Object.assign(resultData, englishData);
+                  displayResults(resultData);
+                }
+                resultDiv.innerHTML = resultDiv.innerHTML.replace('Stage 3/3: Loading English translations...', '');
+                cachedResults.set(cacheKey, resultData); // Cache complete results
+              }).catch(error => {
+                console.warn('English translation query failed:', error);
+                resultData.prefecture_en = 'N/A';
+                resultData.municipality_en = 'N/A';
+                resultData.area_en = 'N/A';
+                displayResults(resultData);
+                resultDiv.innerHTML = resultDiv.innerHTML.replace('Stage 3/3: Loading English translations...', '');
+                cachedResults.set(cacheKey, resultData);
+              });
+            } else {
+              console.error('No Japanese data returned');
+              resultData.prefecture_ja = 'N/A';
+              resultData.municipality_ja = 'N/A';
+              resultData.area_ja = 'N/A';
+              resultData.prefecture_en = 'N/A';
+              resultData.municipality_en = 'N/A';
+              resultData.area_en = 'N/A';
+              displayResults(resultData);
+              resultDiv.innerHTML = resultDiv.innerHTML.replace('Stage 2/3: Loading Japanese names...', 'No Japanese names found');
+              cachedResults.set(cacheKey, resultData);
+            }
+          }).catch(error => {
+            console.error('Japanese names query failed:', error);
+            resultDiv.className = 'alert alert-danger';
+            resultDiv.innerHTML = '<strong>Error loading Japanese names:</strong><pre>' + error.toString() + '</pre>';
+            queryBtn.disabled = false;
+            getCenterBtn.disabled = false;
+          });
+
+        } catch (error) {
+          resultDiv.className = 'alert alert-danger';
+          resultDiv.innerHTML = '<strong>An error occurred:</strong><pre>' + error.toString() + '</pre>';
+          queryBtn.disabled = false;
+          getCenterBtn.disabled = false;
+        }
+      }
+
+      function displayMapOnly(geom) {
+        if (!geom) return;
+        
+        // **Robust WKT Cleaning**
+        var cleanedWkt = geom.trim();
+        var match = cleanedWkt.match(/(POLYGON|MULTIPOLYGON)\s*\(\(.*\)\)/i);
+        if (match) {
+            cleanedWkt = match[0];
+        }
+
+        var geojson = wellknown.parse(cleanedWkt);
+
+        if (geojson) {
+            mapDiv.style.display = 'block';
+            if (map) { map.remove(); }
+            map = L.map('map');
+            L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+            }).addTo(map);
+
+            var geometryLayer = L.geoJSON(geojson, { style: { color: 'red', weight: 5 } });
+            geometryLayer.addTo(map);
+
+            try {
+                map.fitBounds(geometryLayer.getBounds());
+            } catch (e) {
+                map.setView([parseFloat(latInput.value), parseFloat(lonInput.value)], 12);
+            }
+        }
+      }
+
+      async function fetchJapaneseNames(areaEntity) {
+        if (!areaEntity) {
+          console.error('No area entity provided to fetchJapaneseNames');
+          return null;
+        }
+
+        console.log('Fetching Japanese names for entity:', areaEntity);
+
+        // First try to get basic info about the entity
+        const diagnosticQuery = `
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX dcterms: <http://purl.org/dc/terms/>
+SELECT ?property ?value
+WHERE {
+    <${areaEntity}> ?property ?value .
+}`;
+
+        console.log('Diagnostic query:', diagnosticQuery);
+
+        let diagnosticResponse;
+        try {
+          diagnosticResponse = await fetch(url, {
+            method: 'POST',
+            headers: { 
+              'Content-Type': 'application/x-www-form-urlencoded',
+              'Accept': 'application/sparql-results+json'
+            },
+            body: new URLSearchParams({query: diagnosticQuery})
+          });
+          if (diagnosticResponse.ok) {
+            const diagnosticData = await diagnosticResponse.json();
+            console.log('Diagnostic response:', diagnosticData);
+          } else {
+            console.error('Diagnostic query HTTP error:', diagnosticResponse.status, diagnosticResponse.statusText);
+          }
+        } catch (e) {
+          console.error('Diagnostic query failed:', e);
+        }
+
+        // Simplified query - just get the basic labels first
+        const japaneseQuery = `
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+PREFIX dcterms: <http://purl.org/dc/terms/>
+SELECT ?area_ja ?parent1 ?parent1_ja ?parent2 ?parent2_ja
+WHERE {
+    <${areaEntity}> rdfs:label ?area_ja .
+    FILTER(LANG(?area_ja) = 'ja')
+    
+    OPTIONAL {
+        <${areaEntity}> dcterms:isPartOf ?parent1 .
+        ?parent1 rdfs:label ?parent1_ja .
+        FILTER(LANG(?parent1_ja) = 'ja')
+        
+        OPTIONAL {
+            ?parent1 dcterms:isPartOf ?parent2 .
+            ?parent2 rdfs:label ?parent2_ja .
+            FILTER(LANG(?parent2_ja) = 'ja')
+        }
+    }
+}`;
+
+        console.log('Japanese query:', japaneseQuery);
+
+        const url = 'https://data.e-stat.go.jp/lod/sparql/alldata/query';
+        
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'Accept': 'application/sparql-results+json'
+          },
+          body: new URLSearchParams({query: japaneseQuery})
+        });
+
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        }
+
+        const data = await response.json();
+        console.log('Japanese query raw response:', data);
+        
+        if (data.results && data.results.bindings && data.results.bindings.length > 0) {
+          const binding = data.results.bindings[0];
+          console.log('Japanese binding:', binding);
+          
+          // Note: SPARQL endpoint returns variable names in UPPERCASE
+          const area_ja = binding.AREA_JA ? binding.AREA_JA.value : 'N/A';
+          let municipality_ja = 'N/A';
+          let prefecture_ja = 'N/A';
+          let municipality_entity = null;
+          let prefecture_entity = null;
+          
+          // Check parent hierarchy
+          const parent1_label = binding.PARENT1_JA?.value;
+          const parent1_entity = binding.PARENT1?.value;
+          const parent2_label = binding.PARENT2_JA?.value;
+          const parent2_entity = binding.PARENT2?.value;
+          
+          // Identify prefecture and municipality
+          if (parent2_label && parent2_label.match(/[都道府県]$/)) {
+            prefecture_ja = parent2_label;
+            prefecture_entity = parent2_entity;
+            if (parent1_label && parent1_label.match(/[市町村区]$/)) {
+              municipality_ja = parent1_label;
+              municipality_entity = parent1_entity;
+            }
+          } else if (parent1_label && parent1_label.match(/[都道府県]$/)) {
+            prefecture_ja = parent1_label;
+            prefecture_entity = parent1_entity;
+          } else if (parent1_label && parent1_label.match(/[市町村区]$/)) {
+            municipality_ja = parent1_label;
+            municipality_entity = parent1_entity;
+          }
+          
+          return {
+            prefecture_ja,
+            municipality_ja,
+            area_ja,
+            municipality_entity,
+            prefecture_entity
+          };
+        }
+        
+        console.log('No Japanese results found');
+        return null;
+      }
+
+      async function fetchEnglishTranslations(resultData) {
+        if (!resultData.area_entity || !resultData.municipality_entity || !resultData.prefecture_entity) {
+          return null;
+        }
+
+        const englishQuery = `
+PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+SELECT ?prefecture_en ?municipality_en ?area_en
+WHERE {
+    OPTIONAL { <${resultData.area_entity}> rdfs:label ?area_en . FILTER(LANG(?area_en) = 'en') . }
+    OPTIONAL { <${resultData.municipality_entity}> rdfs:label ?municipality_en . FILTER(LANG(?municipality_en) = 'en') . }
+    OPTIONAL { <${resultData.prefecture_entity}> rdfs:label ?prefecture_en . FILTER(LANG(?prefecture_en) = 'en') . }
+}`;
+
+        const url = 'https://data.e-stat.go.jp/lod/sparql/alldata/query';
+        
+        const response = await fetch(url, {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({query: query})
-        })
-          .then(response => response.json())
-          .then(function(data) {
-              responseContainer.style.display = 'block';
-              rawResponseEl.textContent = JSON.stringify(data, null, 2);
-              queryTextEl.parentNode.style.display = 'none'; // Collapse SPARQL Query section after result
+          body: new URLSearchParams({query: englishQuery})
+        });
 
-              if (data.error || !data.results || !data.results.bindings || data.results.bindings.length === 0) {
-                  resultDiv.className = 'alert alert-warning';
-                  resultDiv.textContent = 'No results found or server returned an error.';
-                  queryBtn.disabled = false;
-                  return;
+        const data = await response.json();
+        
+        if (data.results && data.results.bindings && data.results.bindings.length > 0) {
+          const binding = data.results.bindings[0];
+          return {
+            prefecture_en: binding.PREFECTURE_EN ? binding.PREFECTURE_EN.value : 'N/A',
+            municipality_en: binding.MUNICIPALITY_EN ? binding.MUNICIPALITY_EN.value : 'N/A',
+            area_en: binding.AREA_EN ? binding.AREA_EN.value : 'N/A'
+          };
+        }
+        
+        return null;
+      }
+
+      function displayResults(resultData) {
+        const { prefecture_ja, prefecture_en, municipality_ja, municipality_en, area_ja, area_en, geom } = resultData;
+
+        responseContainer.style.display = 'block';
+        rawResponseEl.textContent = JSON.stringify(resultData, null, 2);
+        queryTextEl.parentNode.style.display = 'none';
+
+        // Only update these if we have Japanese data
+        if (prefecture_ja && prefecture_ja !== 'Loading...') {
+          currentPrefectureJa = prefecture_ja;
+        }
+        if (municipality_ja && municipality_ja !== 'Loading...') {
+          currentMunicipalityJa = municipality_ja;
+        }
+
+        resultDiv.className = 'alert alert-success';
+        const full_address_ja = prefecture_ja + ' ' + municipality_ja + ' ' + area_ja;
+        const full_address_en = prefecture_en + ' ' + municipality_en + ' ' + area_en;
+
+        // Build results HTML with loading indicators
+        let statusMessage = '';
+        if (prefecture_ja === 'Loading...' || municipality_ja === 'Loading...' || area_ja === 'Loading...') {
+          statusMessage = '<div class="text-info mb-2"><strong>Loading Japanese names...</strong></div>';
+        } else if (prefecture_en === 'Loading...' || municipality_en === 'Loading...' || area_en === 'Loading...') {
+          statusMessage = '<div class="text-info mb-2"><strong>Loading English translations...</strong></div>';
+        }
+
+        resultDiv.innerHTML = `${statusMessage}
+                               <strong>Prefecture (JA):</strong> ${prefecture_ja}<br>
+                               <strong>Prefecture (EN):</strong> ${prefecture_en}<br>
+                               <strong>Municipality (JA):</strong> ${municipality_ja}<br>
+                               <strong>Municipality (EN):</strong> ${municipality_en}<br>
+                               <strong>Area (JA):</strong> ${area_ja}<br>
+                               <strong>Area (EN):</strong> ${area_en}<br>
+                               <strong>Full Address (JA):</strong> ${full_address_ja}<br>
+                               <strong>Full Address (EN):</strong> ${full_address_en}`;
+
+        // Only update search input if we have actual Japanese data
+        if (prefecture_ja !== 'Loading...' && municipality_ja !== 'Loading...' && area_ja !== 'Loading...') {
+          addressSearchInput.value = full_address_ja;
+        }
+
+        // Only search for postal codes if we have actual Japanese data (not loading)
+        if (prefecture_ja !== 'Loading...' && municipality_ja !== 'Loading...' && area_ja !== 'Loading...') {
+          searchPostalCodesByPartialAddress(prefecture_ja, municipality_ja, area_ja).then(results => {
+              addressSearchResults.innerHTML = ''; // Clear previous results
+              if (results.length == 0) {
+                  resultDiv.innerHTML += `<br><strong>Postal Code:</strong> Not found`;
+              } else {
+                  resultDiv.innerHTML += `<br><strong>Postal Code ${results.length} Candidates</strong> `;
               }
+              if (results.length > 0) {
+                  results.forEach(result => {
+                      console.log('Result object:', result);
+                      const li = document.createElement('li');
+                      li.className = 'list-group-item list-group-item-action';
+                      li.innerHTML = `
+                          <div>
+                              ${result.postalCode}: ${result.prefecture}${result.city}${result.address}
+                              <button class="btn btn-sm btn-outline-secondary copy-address-btn" data-address="${result.prefecture}${result.city}${result.address}">Copy JA</button>
+                          </div>
+                          <div>
+                              ${result.postalCode}: ${result.prefecture_rome} ${result.city_rome} ${result.address_rome}
+                              <button class="btn btn-sm btn-outline-secondary copy-address-btn" data-address="${result.prefecture_rome} ${result.city_rome} ${result.address_rome}">Copy EN</button>
+                          </div>
+                          <pre id="json-output-${result.postalCode}">${JSON.stringify(result, null, 2)}</pre>
+                          <button class="btn btn-sm btn-outline-secondary copy-json-btn" data-target-id="json-output-${result.postalCode}">Copy JSON</button>
+                      `;
+                      li.style.cursor = 'pointer';
+                      li.onclick = () => {
+                          console.log('Selected postal code from SPARQL result:', result.postalCode);
+                          addressSearchInput.value = `${result.prefecture}${result.city}${result.address}`;
+                          addressSearchResults.innerHTML = '';
+                          addressSearchInput.dispatchEvent(new Event('input'));
+                      };
+                      addressSearchResults.appendChild(li);
 
-              var binding = data.results.bindings[0];
-              var prefecture_ja = binding.PREFECTURE_JA ? binding.PREFECTURE_JA.value : 'N/A';
-              var prefecture_en = binding.PREFECTURE_EN ? binding.PREFECTURE_EN.value : 'N/A';
-              var municipality_ja = binding.MUNICIPALITY_JA.value;
-              var area_ja = binding.AREA_JA.value;
-              var municipality_en = binding.MUNICIPALITY_EN ? binding.MUNICIPALITY_EN.value : 'N/A';
-              var area_en = binding.AREA_EN ? binding.AREA_EN.value : 'N/A';
-              var wkt = binding.GEOM.value;
-
-              currentPrefectureJa = prefecture_ja;
-              currentMunicipalityJa = municipality_ja;
-
-              resultDiv.className = 'alert alert-success';
-              var full_address_ja = prefecture_ja + ' ' + municipality_ja + ' ' + area_ja;
-              var full_address_en = prefecture_en + ' ' + municipality_en + ' ' + area_en;
-
-              resultDiv.innerHTML = `<strong>Prefecture (JA):</strong> ${prefecture_ja}<br>
-                                   <strong>Prefecture (EN):</strong> ${prefecture_en}<br>
-                                   <strong>Municipality (JA):</strong> ${municipality_ja}<br>
-                                   <strong>Municipality (EN):</strong> ${municipality_en}<br>
-                                   <strong>Area (JA):</strong> ${area_ja}<br>
-                                   <strong>Area (EN):</strong> ${area_en}<br>
-                                   <strong>Full Address (JA):</strong> ${full_address_ja}<br>
-                                   <strong>Full Address (EN):</strong> ${full_address_en}`;
-
-              addressSearchInput.value = full_address_ja; // Update search field with full address
-
-              // Get and display postal code
-              //getPostalCodeFromAddress(prefecture_ja, municipality_ja, area_ja).then(postalCode => {
-              //    if (postalCode) {
-              //        resultDiv.innerHTML += `<br><strong>Postal Code:</strong> ${postalCode}`;
-              //    } else {
-              //        resultDiv.innerHTML += `<br><strong>Postal Code:</strong> Not found`;
-              //    }
-              //}).catch(error => {
-              //    console.error('Error getting postal code:', error);
-              //    resultDiv.innerHTML += `<br><strong>Postal Code:</strong> Error retrieving`;
-              //});
-
-              // Automatically search for postal codes based on the full address from SPARQL query
-              searchPostalCodesByPartialAddress(prefecture_ja, municipality_ja, area_ja).then(results => {
-                  addressSearchResults.innerHTML = ''; // Clear previous results
-		  if (results.length == 0) {
-                      resultDiv.innerHTML += `<br><strong>Postal Code:</strong> Not found`;
-		  } else {
-			  resultDiv.innerHTML += `<br><strong>Postal Code ${results.length} Candidates</strong> `;
-		  }
-                  if (results.length > 0) {
-		      
-
-                      results.forEach(result => {
-                          console.log('Result object:', result); // Add this line for debugging
-                          const li = document.createElement('li');
-                          li.className = 'list-group-item list-group-item-action';
-                          li.innerHTML = `
-                              <div>
-                                  ${result.postalCode}: ${result.prefecture}${result.city}${result.address}
-                                  <button class="btn btn-sm btn-outline-secondary copy-address-btn" data-address="${result.prefecture}${result.city}${result.address}">Copy JA</button>
-                              </div>
-                              <div>
-                                  ${result.postalCode}: ${result.prefecture_rome} ${result.city_rome} ${result.address_rome}
-                                  <button class="btn btn-sm btn-outline-secondary copy-address-btn" data-address="${result.prefecture_rome} ${result.city_rome} ${result.address_rome}">Copy EN</button>
-                              </div>
-                              <pre id="json-output-${result.postalCode}">${JSON.stringify(result, null, 2)}</pre> <!-- Added for debugging -->
-                              <button class="btn btn-sm btn-outline-secondary copy-json-btn" data-target-id="json-output-${result.postalCode}">Copy JSON</button>
-                          `;
-                          li.style.cursor = 'pointer';
-                          li.onclick = () => {
-                              console.log('Selected postal code from SPARQL result:', result.postalCode);
-                              addressSearchInput.value = `${result.prefecture}${result.city}${result.address}`;
-                              addressSearchResults.innerHTML = '';
-                              addressSearchInput.dispatchEvent(new Event('input')); // Trigger search
-                          };
-                          addressSearchResults.appendChild(li);
-
-                          // Add event listeners for the new copy buttons
-                          li.querySelectorAll('.copy-address-btn').forEach(button => {
-                              button.addEventListener('click', (e) => {
-                                  e.stopPropagation(); // Prevent li.onclick from firing
-                                  const addressToCopy = button.dataset.address;
-                                  navigator.clipboard.writeText(addressToCopy).then(() => {
-                                      button.textContent = 'Copied!';
-                                      setTimeout(() => { button.textContent = button.dataset.address.includes(' ') ? 'Copy EN' : 'Copy JA'; }, 2000);
-                                  }, (err) => console.error('Could not copy text: ', err));
-                              });
-                          });
-
-                          li.querySelectorAll('.copy-json-btn').forEach(button => {
-                              button.addEventListener('click', (e) => {
-                                  e.stopPropagation(); // Prevent li.onclick from firing
-                                  const targetId = button.dataset.targetId;
-                                  const jsonText = document.getElementById(targetId).textContent;
-                                  navigator.clipboard.writeText(jsonText).then(() => {
-                                      button.textContent = 'Copied!';
-                                      setTimeout(() => { button.textContent = 'Copy JSON'; }, 2000);
-                                  }, (err) => console.error('Could not copy JSON: ', err));
-                              });
+                      // Add event listeners for copy buttons
+                      li.querySelectorAll('.copy-address-btn').forEach(button => {
+                          button.addEventListener('click', (e) => {
+                              e.stopPropagation();
+                              const addressToCopy = button.dataset.address;
+                              navigator.clipboard.writeText(addressToCopy).then(() => {
+                                  button.textContent = 'Copied!';
+                                  setTimeout(() => { button.textContent = button.dataset.address.includes(' ') ? 'Copy EN' : 'Copy JA'; }, 2000);
+                              }, (err) => console.error('Could not copy text: ', err));
                           });
                       });
-                  } else {
-                      const li = document.createElement('li');
-                      li.className = 'list-group-item';
-                      li.textContent = 'No postal code candidates found for this address.';
-                      addressSearchResults.appendChild(li);
-                  }
-              }).catch(error => {
-                  console.error('Error searching postal codes from SPARQL result:', error);
+
+                      li.querySelectorAll('.copy-json-btn').forEach(button => {
+                          button.addEventListener('click', (e) => {
+                              e.stopPropagation();
+                              const targetId = button.dataset.targetId;
+                              const jsonText = document.getElementById(targetId).textContent;
+                              navigator.clipboard.writeText(jsonText).then(() => {
+                                  button.textContent = 'Copied!';
+                                  setTimeout(() => { button.textContent = 'Copy JSON'; }, 2000);
+                              }, (err) => console.error('Could not copy JSON: ', err));
+                          });
+                      });
+                  });
+              } else {
                   const li = document.createElement('li');
                   li.className = 'list-group-item';
-                  li.textContent = 'Error searching postal code candidates.';
+                  li.textContent = 'No postal code candidates found for this address.';
                   addressSearchResults.appendChild(li);
-              });
-              
-              // **Robust WKT Cleaning**
-              var cleanedWkt = wkt.trim();
-              var match = cleanedWkt.match(/(POLYGON|MULTIPOLYGON)\s*\(\(.*\)\)/i);
-              if (match) {
-                cleanedWkt = match[0];
               }
-
-              var geojson = wellknown.parse(cleanedWkt);
-
-              if (!geojson) {
-                  resultDiv.innerHTML += '<br><strong>Error:</strong> Could not parse the cleaned WKT geometry.';
-                  queryBtn.disabled = false;
-                  return;
-              }
-
-              mapDiv.style.display = 'block';
-              map = L.map('map');
-              L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-                  attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-              }).addTo(map);
-
-              var geometryLayer = L.geoJSON(geojson, { style: { color: 'red', weight: 5 } });
-              geometryLayer.addTo(map);
-
-              try {
-                  map.fitBounds(geometryLayer.getBounds());
-              } catch (e) {
-                  map.setView([latitude, longitude], 12);
-              }
-              queryBtn.disabled = false;
-              getCenterBtn.disabled = false;
-          })
-          .catch(function(error) {
-              resultDiv.className = 'alert alert-danger';
-              resultDiv.innerHTML = '<strong>An error occurred:</strong><pre>' + error.toString() + '</pre>';
-              queryBtn.disabled = false;
+          }).catch(error => {
+              console.error('Error searching postal codes from SPARQL result:', error);
+              const li = document.createElement('li');
+              li.className = 'list-group-item';
+              li.textContent = 'Error searching postal code candidates.';
+              addressSearchResults.appendChild(li);
           });
+        }
+        
+        // Map is already displayed in displayMapOnly function during stage 1
+        // Only re-enable buttons when all data is loaded or failed
+        if (prefecture_ja !== 'Loading...' && municipality_ja !== 'Loading...' && area_ja !== 'Loading...') {
+          queryBtn.disabled = false;
+          getCenterBtn.disabled = false;
+        }
       }
 
       function getMapCenter() {
@@ -342,8 +584,8 @@ WHERE {
       const clearCacheBtn = document.getElementById('clear-cache-btn');
       clearCacheBtn.addEventListener('click', async () => {
           await clearAllCache();
-          alert('Cache cleared!');
-          // Optionally, reload the page or re-fetch data after clearing cache
+          cachedResults.clear(); // Clear SPARQL cache
+          alert('All caches cleared!');
           location.reload(); 
       });
 
