@@ -375,7 +375,7 @@ document.addEventListener('DOMContentLoaded', function() {
     var clearFilterButton = document.getElementById('clearFilter');
     var useCurrentLocationButton = document.getElementById('useCurrentLocation');
     var markerCountDiv = document.getElementById('marker-count');
-    var apiUrl = 'https://gateway-api.global.rakuten.com/mmeu/api/v3/stores?client_id=integrated&longitude=139.641021&latitude=35.909794'; // Default API URL
+    var apiUrl = 'http://localhost:8080/mmeu/api/v3/stores?client_id=integrated&longitude=139.641021&latitude=35.909794'; // Default API URL
 
     
 
@@ -705,7 +705,7 @@ document.addEventListener('DOMContentLoaded', function() {
             }
         }
 
-        const storeDetailUrl = `https://gateway-api.global.rakuten.com/mmeu/api/v3/store/${store.map_store_id}?client_id=integrated`;
+        const storeDetailUrl = `/mmeu/api/v3/store/${store.map_store_id}?client_id=integrated`;
         try {
             const response = await fetch(storeDetailUrl);
             if (!response.ok) {
@@ -1169,7 +1169,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 callback: (e) => {
                     const { lat, lng } = e.latlng;
                     logDebug(`Fetching stores for new location: Lat ${lat}, Lng ${lng}`);
-                    apiUrl = `https://gateway-api.global.rakuten.com/mmeu/api/v3/stores?client_id=integrated&longitude=${lng}&latitude=${lat}`;
+                    apiUrl = `http://localhost:8080/mmeu/api/v3/stores?client_id=integrated&longitude=${lng}&latitude=${lat}`;
                     fetchAndCacheStores(true); // Incremental load
                 }
             }]
@@ -1640,7 +1640,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 var lat = position.coords.latitude;
                 var lon = position.coords.longitude;
                 logDebug(`Current location: Latitude ${lat}, Longitude ${lon}`);
-                apiUrl = `https://gateway-api.global.rakuten.com/mmeu/api/v3/stores?client_id=integrated&longitude=${lon}&latitude=${lat}`;
+                apiUrl = `http://localhost:8080/mmeu/api/v3/stores?client_id=integrated&longitude=${lon}&latitude=${lat}`;
                 logDebug(`Updated API URL for current location: ${apiUrl}`);
                 fetchAndCacheStores(true); // Incremental load
             }, function(error) {
