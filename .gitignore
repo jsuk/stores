@@ -9,6 +9,8 @@ yarn-error.log*
 
 # Generated KML files
 route_*.kml
+test_*.kml
+*.kml
 
 # Environment
 .env
