@@ -8,7 +8,7 @@ const AdmZip = require('adm-zip');
 const iconv = require('iconv-lite');
 
 // Configuration
-const API_BASE_URL = 'http://localhost:8080/mmeu/api/v3';
+const API_BASE_URL = process.env.RAKUTEN_API_URL || 'https://gateway-api.global.rakuten.com/mmeu/api/v3';
 const CLIENT_ID = 'integrated';
 const CACHE_DIR = path.join(__dirname, '.cache');
 const CACHE_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -95,6 +95,18 @@ function filterExcludedStores(stores) {
 }
 
 /**
+ * Filter stores to only include those with rpay service
+ */
+function filterRpayStores(stores) {
+  return stores.filter(store => {
+    if (!store.service_id || !Array.isArray(store.service_id)) {
+      return false;
+    }
+    return store.service_id.includes('rpay');
+  });
+}
+
+/**
  * Get all stores with details (cached or from API)
  */
 async function getAllStores(options = {}) {
@@ -112,6 +124,7 @@ async function getAllStores(options = {}) {
 
   // Fetch from API
   let stores = await fetchStoresFromAPI(options.centerLat, options.centerLng);
+  stores = filterRpayStores(stores);
   stores = filterExcludedStores(stores);
 
   // Fetch details for each store (in batches to avoid overwhelming the API)

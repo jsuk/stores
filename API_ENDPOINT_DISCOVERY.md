@@ -1,14 +1,31 @@
 # Rakuten Pay Store API Endpoint Discovery Guide
 
-## Current Status
+## ✅ DISCOVERED - Real Endpoint Found!
 
-Your application uses:
+**Rakuten Global API Gateway**:
+```
+https://gateway-api.global.rakuten.com/mmeu/api/v3/stores?latitude={lat}&longitude={lng}&client_id=integrated
+https://gateway-api.global.rakuten.com/mmeu/api/v3/store/{map_store_id}?client_id=integrated
+```
+
+**Important**:
+- Filter for rpay stores: `select(.service_id[] | any(.; . == "rpay"))`
+- Response structure: `{ stores: [...] }` where each store has a `service_id` array
+- Store fields: `store_name`, `latitude`, `longitude`, `map_store_id`, `service_id[]`
+
+**See**: `rpay_stores.sh` for working example
+
+---
+
+## Previous Status (for reference)
+
+Your application previously used:
 ```
 http://localhost:8080/mmeu/api/v3/stores?client_id=integrated&longitude={lng}&latitude={lat}
 http://localhost:8080/mmeu/api/v3/store/{map_store_id}?client_id=integrated
 ```
 
-**Issue**: These are localhost endpoints, suggesting a proxy/middleware service that interfaces with Rakuten Pay's actual API.
+These were localhost proxy endpoints. The real API is now known (see above).
 
 ## Research Summary
 

@@ -14,8 +14,10 @@ A command-line tool to generate KML files for Google Maps showing an ordered lis
 ## Prerequisites
 
 - Node.js 14.x or higher
-- Access to the rpay store API at `http://localhost:8080/mmeu/api/v3`
+- Internet access to Rakuten Global API Gateway (`https://gateway-api.global.rakuten.com`)
 - Postal code data files in `zipcode/dl/roman/KEN_ALL_ROME.zip`
+
+**Note**: The tool now uses the real Rakuten Pay API endpoint, no localhost proxy needed!
 
 ## Installation
 
@@ -150,12 +152,45 @@ Cache files are automatically refreshed after 24 hours or can be bypassed using 
 
 ## API Integration
 
-The tool integrates with the following endpoints:
+The tool integrates with the **Rakuten Global API Gateway**:
 
-- `GET /mmeu/api/v3/stores?client_id=integrated&longitude={lng}&latitude={lat}`
-  - Fetches all stores near a location
-- `GET /mmeu/api/v3/store/{map_store_id}?client_id=integrated`
-  - Fetches detailed information for a specific store (including postal code)
+### Endpoint 1: Get Stores by Location
+```
+GET https://gateway-api.global.rakuten.com/mmeu/api/v3/stores
+    ?latitude={lat}
+    &longitude={lng}
+    &client_id=integrated
+```
+- Fetches all stores near a location
+- Filters for stores with `service_id` containing `"rpay"`
+- Returns array of stores with coordinates and metadata
+
+### Endpoint 2: Get Store Details
+```
+GET https://gateway-api.global.rakuten.com/mmeu/api/v3/store/{map_store_id}
+    ?client_id=integrated
+```
+- Fetches detailed information for a specific store
+- Includes postal code and full address
+- Used to enrich store data with postal codes
+
+### Response Structure
+```json
+{
+  "stores": [
+    {
+      "map_store_id": "store_123",
+      "store_name": "Example Store",
+      "latitude": 35.6812,
+      "longitude": 139.7671,
+      "service_id": ["rpay", "..."],
+      ...
+    }
+  ]
+}
+```
+
+**See also**: `rpay_stores.sh` for a bash example of API usage
 
 ## Route Optimization Algorithm
 
@@ -178,9 +213,10 @@ This provides a good approximation of the optimal route (TSP solution) with O(nÂ
 
 ### API connection errors
 
-- Ensure the rpay store API is running at `http://localhost:8080`
-- Check network connectivity
-- Verify API credentials and client_id
+- Check internet connectivity to `gateway-api.global.rakuten.com`
+- Verify the API is accessible (may require being in Japan or using VPN)
+- Check that `client_id=integrated` is accepted by the API
+- Look for CORS or network firewall issues
 
 ### Postal code not found in database
 
