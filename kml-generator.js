@@ -13,6 +13,42 @@ const CLIENT_ID = 'integrated';
 const CACHE_DIR = path.join(__dirname, '.cache');
 const CACHE_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
 
+/**
+ * Geocode postal code using OpenStreetMap Nominatim
+ */
+async function geocodePostalCode(postalCode, postalInfo) {
+  if (!postalInfo || postalInfo.length === 0) {
+    console.warn(`No postal info available for ${postalCode}. Cannot geocode.`);
+    return null;
+  }
+  const info = postalInfo[0];
+  const query = `${info.prefecture} ${info.city} ${info.address}, Japan`;
+  const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1`;
+
+  console.log(`Geocoding address: ${query}`);
+  try {
+    const response = await fetch(url, {
+      headers: {
+        'User-Agent': 'RpayStoreKMLGenerator/1.0 (test-user@test.com)' // Replace with actual contact email
+      }
+    });
+    if (!response.ok) {
+      throw new Error(`Nominatim API request failed: ${response.statusText}`);
+    }
+    const data = await response.json();
+    if (data && data.length > 0) {
+      console.log(`Geocoded ${query} to Lat: ${data[0].lat}, Lng: ${data[0].lon}`);
+      return { latitude: parseFloat(data[0].lat), longitude: parseFloat(data[0].lon) };
+    } else {
+      console.warn(`No geocoding results for ${query}`);
+      return null;
+    }
+  } catch (error) {
+    console.error('Error geocoding postal code:', error.message);
+    return null;
+  }
+}
+
 // Store exclusion list (same as in stores.html)
 const EXCLUDE_STORE_NAMES_CONTAINING = [
   'セブンイレブン', 'ローソン', 'ファミリーマート', 'ミニストップ', 'デイリーヤマザキ',
@@ -49,7 +85,7 @@ async function isCacheValid(cachePath) {
  * Fetch all stores from API
  */
 async function fetchStoresFromAPI(centerLat = 35.6812, centerLng = 139.7671) {
-  console.log('Fetching stores from API...');
+  console.log(`Fetching stores from API using Lat: ${centerLat}, Lng: ${centerLng}...`);
   const url = `${API_BASE_URL}/stores?client_id=${CLIENT_ID}&longitude=${centerLng}&latitude=${centerLat}`;
 
   try {
@@ -57,7 +93,8 @@ async function fetchStoresFromAPI(centerLat = 35.6812, centerLng = 139.7671) {
     if (!response.ok) {
       throw new Error(`API request failed: ${response.statusText}`);
     }
-    const stores = await response.json();
+    const data = await response.json();
+    const stores = data.stores;
     console.log(`Fetched ${stores.length} stores from API`);
     return stores;
   } catch (error) {
@@ -335,7 +372,7 @@ function generateKML(orderedStores, postalCode, postalInfo) {
     kml += '  <Placemark>\n';
     kml += `    <name>${index + 1}. ${escapeTags(store.store_name)}</name>\n`;
     kml += '    <description>';
-    kml += `Store ID: ${escapeTags(store.map_store_id)}\\n`;
+    kml += `Store ID: ${escapeTags(String(store.map_store_id))}\\n`;
     if (store.postal_code) {
       kml += `Postal Code: ${escapeTags(store.postal_code)}\\n`;
     }
@@ -385,7 +422,7 @@ async function main() {
     .version('1.0.0')
     .argument('<postal-code>', 'Japanese postal code (e.g., 100-0001 or 1000001)')
     .option('-o, --output <file>', 'Output KML file path')
-    .option('--no-cache', 'Skip cache and fetch fresh data from API')
+    .option('-c, --cache', 'Enable caching for API calls (default: disabled)')
     .option('--center-lat <latitude>', 'Center latitude for store search', parseFloat)
     .option('--center-lng <longitude>', 'Center longitude for store search', parseFloat)
     .option('--no-optimize', 'Skip route optimization (use store order as-is)')
@@ -410,12 +447,27 @@ async function main() {
           console.log(`   Warning: Postal code ${normalizedPostalCode} not found in database`);
         }
 
+        // Determine center coordinates for store search
+        let centerLat = options.centerLat;
+        let centerLng = options.centerLng;
+
+        if ((!centerLat || !centerLng) && postalInfo && postalInfo.length > 0) {
+          console.log(`\n🌍 Geocoding postal code ${normalizedPostalCode} to get center coordinates...`);
+          const geocodeResult = await geocodePostalCode(normalizedPostalCode, postalInfo);
+          if (geocodeResult) {
+            centerLat = geocodeResult.latitude;
+            centerLng = geocodeResult.longitude;
+          } else {
+            console.warn('Geocoding failed, using default center coordinates for store search.');
+          }
+        }
+        
         // Get all stores
         console.log('\n🏪 Fetching store data...');
         const allStores = await getAllStores({
-          noCache: !options.cache,
-          centerLat: options.centerLat,
-          centerLng: options.centerLng
+          noCache: !options.cache, // Now !options.cache correctly means "disable caching" if --cache is absent
+          centerLat: centerLat,
+          centerLng: centerLng
         });
 
         // Filter by postal code
