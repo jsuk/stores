@@ -6,6 +6,7 @@ const { Command } = require('commander');
 const fetch = require('node-fetch');
 const AdmZip = require('adm-zip');
 const iconv = require('iconv-lite');
+const wellknown = require('wellknown');
 
 // Configuration
 const API_BASE_URL = process.env.RAKUTEN_API_URL || 'https://gateway-api.global.rakuten.com/mmeu/api/v3';
@@ -14,7 +15,7 @@ const CACHE_DIR = path.join(__dirname, '.cache');
 const CACHE_EXPIRY_MS = 24 * 60 * 60 * 1000; // 24 hours
 
 /**
- * Geocode postal code using OpenStreetMap Nominatim
+ * Geocode postal code using e-stat.go.jp SPARQL endpoint
  */
 async function geocodePostalCode(postalCode, postalInfo) {
   if (!postalInfo || postalInfo.length === 0) {
@@ -22,31 +23,125 @@ async function geocodePostalCode(postalCode, postalInfo) {
     return null;
   }
   const info = postalInfo[0];
-  const query = `${info.prefecture} ${info.city} ${info.address}, Japan`;
-  const url = `https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}&limit=1`;
+  const { prefecture, city, address } = info;
 
-  console.log(`Geocoding address: ${query}`);
-  try {
-    const response = await fetch(url, {
-      headers: {
-        'User-Agent': 'RpayStoreKMLGenerator/1.0 (test-user@test.com)' // Replace with actual contact email
-      }
-    });
-    if (!response.ok) {
-      throw new Error(`Nominatim API request failed: ${response.statusText}`);
+  console.log(`Geocoding address: ${prefecture} ${city} ${address}`);
+
+  const sparqlEndpoint = 'https://data.e-stat.go.jp/lod/sparql/alldata/query';
+
+  // Step 1: Find entities that have geometry and are part of the city and prefecture,
+  // and whose label matches the address part.
+  const findGeomEntityQuery = `
+    PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+    PREFIX dcterms: <http://purl.org/dc/terms/>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+
+    SELECT DISTINCT ?geom_entity ?label ?geom
+    WHERE {
+      ?geom_entity geo:hasGeometry/geo:asWKT ?geom .
+      ?geom_entity rdfs:label ?label .
+      FILTER(LANG(?label) = "ja")
+      FILTER(CONTAINS(STR(?label), "${address}")) # Filter by address part
+
+      ?geom_entity dcterms:isPartOf ?city_entity .
+      ?city_entity rdfs:label "${city}"@ja .
+
+      ?city_entity dcterms:isPartOf ?pref_entity .
+      ?pref_entity rdfs:label "${prefecture}"@ja .
     }
-    const data = await response.json();
-    if (data && data.length > 0) {
-      console.log(`Geocoded ${query} to Lat: ${data[0].lat}, Lng: ${data[0].lon}`);
-      return { latitude: parseFloat(data[0].lat), longitude: parseFloat(data[0].lon) };
-    } else {
-      console.warn(`No geocoding results for ${query}`);
+  `;
+
+  try {
+    const geomResponse = await fetch(sparqlEndpoint, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/sparql-results+json' },
+      body: new URLSearchParams({ query: findGeomEntityQuery })
+    });
+
+    if (!geomResponse.ok) {
+      throw new Error(`SPARQL query failed: ${geomResponse.statusText}`);
+    }
+
+    const geomData = await geomResponse.json();
+    console.log("SPARQL Geom Data Bindings:", JSON.stringify(geomData.results.bindings, null, 2));
+
+    if (!geomData.results || !geomData.results.bindings || geomData.results.bindings.length === 0) {
+      console.warn(`No geometry found for: ${prefecture} ${city} ${address}`);
       return null;
     }
+
+    // Try to find the most specific match, prioritize exact match on address label
+    let bestMatch = geomData.results.bindings.find(binding => {
+      return binding.LABEL && binding.LABEL.value.startsWith(address);
+    });
+
+    // If no exact match, take the first one (could be broader area like a chome)
+    if (!bestMatch) {
+        console.warn(`No exact label match for "${address}". Using first available geometry.`);
+        bestMatch = geomData.results.bindings[0];
+    }
+    
+    const rawWkt = bestMatch.GEOM.value;
+    const wktMatch = rawWkt.match(/(POLYGON|MULTIPOLYGON)\s*\(.*\)/);
+    if (!wktMatch) {
+        console.warn(`Could not extract WKT from: ${rawWkt}`);
+        return null;
+    }
+    const wkt = wktMatch[0];
+    const geojson = wellknown.parse(wkt);
+
+    const [lon, lat] = calculateCentroid(geojson);
+    console.log(`Geocoded to Lat: ${lat}, Lng: ${lon}`);
+    return { latitude: lat, longitude: lon };
+
   } catch (error) {
-    console.error('Error geocoding postal code:', error.message);
+    console.error('Error geocoding with SPARQL:', error.message);
     return null;
   }
+}
+
+/**
+ * Calculate centroid of a GeoJSON polygon.
+ * This is a simple approximation.
+ */
+function calculateCentroid(geojson) {
+  if (geojson.type === 'Polygon') {
+    const coords = geojson.coordinates[0];
+    let x = 0;
+    let y = 0;
+    for (const [lon, lat] of coords) {
+      x += lon;
+      y += lat;
+    }
+    return [x / coords.length, y / coords.length];
+  } else if (geojson.type === 'MultiPolygon') {
+    // For MultiPolygon, find the largest polygon and calculate its centroid
+    let largestPolygon = geojson.coordinates[0];
+    let maxArea = 0;
+
+    for (const polygon of geojson.coordinates) {
+        let area = 0;
+        const ring = polygon[0];
+        for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+            area += (ring[i][0] * ring[j][1]) - (ring[j][0] * ring[i][1]);
+        }
+        area = Math.abs(area / 2);
+
+        if (area > maxArea) {
+            maxArea = area;
+            largestPolygon = polygon;
+        }
+    }
+    const coords = largestPolygon[0];
+    let x = 0;
+    let y = 0;
+    for (const [lon, lat] of coords) {
+      x += lon;
+      y += lat;
+    }
+    return [x / coords.length, y / coords.length];
+  }
+  return [0, 0];
 }
 
 // Store exclusion list (same as in stores.html)
@@ -196,7 +291,7 @@ async function getAllStores(options = {}) {
  * Load and parse postal code data from ZIP file
  */
 async function loadPostalData() {
-  const zipPath = path.join(__dirname, 'zipcode', 'dl', 'roman', 'KEN_ALL_ROME.zip');
+  const zipPath = path.join(__dirname, 'zipcode', 'dl', 'utf', 'zip', 'utf_ken_all.zip');
 
   try {
     const zip = new AdmZip(zipPath);
@@ -208,7 +303,7 @@ async function loadPostalData() {
 
     const csvEntry = zipEntries[0];
     const buffer = csvEntry.getData();
-    const csvText = iconv.decode(buffer, 'shift_jis');
+    const csvText = iconv.decode(buffer, 'utf8');
     const lines = csvText.split('\n');
 
     const postalData = {};
@@ -217,8 +312,11 @@ async function loadPostalData() {
       if (!line.trim()) continue;
 
       const parts = line.split(',').map(p => p.trim().replace(/^"|"$/g, ''));
-      if (parts.length >= 7) {
-        const [postalCode, prefecture, city, address, prefecture_rome, city_rome, address_rome] = parts;
+      if (parts.length >= 9) {
+        const postalCode = parts[2];
+        const prefecture = parts[6];
+        const city = parts[7];
+        const address = parts[8];
 
         if (!postalData[postalCode]) {
           postalData[postalCode] = [];
@@ -228,10 +326,7 @@ async function loadPostalData() {
           postalCode,
           prefecture,
           city,
-          address,
-          prefecture_rome,
-          city_rome,
-          address_rome
+          address
         });
       }
     }
