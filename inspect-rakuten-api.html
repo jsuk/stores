@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Rakuten Pay API Inspector</title>
+    <meta charset="utf-8">
+    <style>
+        body { font-family: monospace; padding: 20px; }
+        #instructions { background: #f0f0f0; padding: 15px; margin-bottom: 20px; }
+        #iframe-container { border: 2px solid #333; margin-top: 20px; }
+        iframe { width: 100%; height: 600px; border: none; }
+        .code { background: #000; color: #0f0; padding: 10px; margin: 10px 0; }
+    </style>
+</head>
+<body>
+    <h1>🔍 Rakuten Pay API Inspector</h1>
+
+    <div id="instructions">
+        <h2>Instructions:</h2>
+        <ol>
+            <li><strong>Open Browser DevTools</strong> (F12 or Cmd+Option+I)</li>
+            <li>Go to the <strong>Network</strong> tab</li>
+            <li>Filter by <strong>XHR</strong> or <strong>Fetch</strong></li>
+            <li>Click "Load Rakuten Map" button below</li>
+            <li>Interact with the map (zoom, pan, search for stores)</li>
+            <li>Look for API calls in Network tab</li>
+        </ol>
+
+        <h3>What to Look For:</h3>
+        <ul>
+            <li>Request URL patterns (e.g., <code>/api/stores</code>, <code>/shop/search</code>)</li>
+            <li>Query parameters (<code>?lat=...&lng=...&radius=...</code>)</li>
+            <li>Request headers (authentication, client-id, etc.)</li>
+            <li>Response format (JSON structure)</li>
+        </ul>
+    </div>
+
+    <button id="loadBtn" onclick="loadMap()">Load Rakuten Pay Map</button>
+    <button onclick="clearConsole()">Clear Console</button>
+
+    <div id="iframe-container">
+        <!-- Map will load here -->
+    </div>
+
+    <h2>Console Output:</h2>
+    <div class="code">
+        <pre id="console"></pre>
+    </div>
+
+    <h2>Alternative: Manual Inspection</h2>
+    <div class="code">
+# Step 1: Open this URL directly in a new tab:
+https://pay.rakuten.co.jp/shop/map/?scid=wi_rpay_app_menu_map&access_from=shopperapp_android&v=2020113000
+
+# Step 2: Open DevTools Network tab
+
+# Step 3: Look for patterns like:
+- Domain: *.rakuten.co.jp or *.rakuten.jp
+- Path: /api/*, /v1/*, /v2/*, /v3/*
+- Method: GET or POST
+- Type: xhr, fetch, or json
+
+# Step 4: Common endpoint patterns to look for:
+- /api/stores
+- /api/shop/search
+- /api/v1/locations
+- /api/v2/shop/nearby
+- /mmeu/api/v3/stores  (your current endpoint path)
+    </div>
+
+    <h2>Expected Response Structure:</h2>
+    <div class="code">
+<pre>{
+  "stores": [
+    {
+      "map_store_id": "...",
+      "store_name": "...",
+      "latitude": 35.6812,
+      "longitude": 139.7671,
+      "postal_code": "100-0001",
+      "address": "...",
+      // ... other fields
+    }
+  ]
+}</pre>
+    </div>
+
+    <script>
+        const consoleDiv = document.getElementById('console');
+
+        function log(message) {
+            consoleDiv.textContent += message + '\n';
+            console.log(message);
+        }
+
+        function clearConsole() {
+            consoleDiv.textContent = '';
+        }
+
+        function loadMap() {
+            log('Loading Rakuten Pay map...');
+            const container = document.getElementById('iframe-container');
+
+            // Try to load the map in iframe
+            const iframe = document.createElement('iframe');
+            iframe.src = 'https://pay.rakuten.co.jp/shop/map/?scid=wi_rpay_app_menu_map&access_from=shopperapp_android&v=2020113000';
+            iframe.onload = () => {
+                log('✅ Map loaded! Check Network tab in DevTools');
+            };
+            iframe.onerror = (e) => {
+                log('❌ Error loading map (this is expected due to CORS)');
+                log('💡 Open the URL directly in a new tab instead');
+            };
+
+            container.innerHTML = '';
+            container.appendChild(iframe);
+        }
+
+        // Intercept fetch and XMLHttpRequest
+        const originalFetch = window.fetch;
+        window.fetch = function(...args) {
+            log('FETCH: ' + args[0]);
+            return originalFetch.apply(this, args);
+        };
+
+        const originalOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function(method, url) {
+            log('XHR: ' + method + ' ' + url);
+            return originalOpen.apply(this, arguments);
+        };
+
+        log('🔍 API Inspector ready!');
+        log('Click "Load Rakuten Map" and watch Network tab in DevTools');
+    </script>
+</body>
+</html>

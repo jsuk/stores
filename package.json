@@ -1,0 +1,28 @@
+{
+  "name": "rpay-store-kml-generator",
+  "version": "1.0.0",
+  "description": "Command-line tool to generate KML files for rpay stores based on Japanese postal codes",
+  "main": "kml-generator.js",
+  "bin": {
+    "kml-generator": "./kml-generator.js"
+  },
+  "scripts": {
+    "start": "node kml-generator.js"
+  },
+  "keywords": [
+    "kml",
+    "google-maps",
+    "rpay",
+    "stores",
+    "postal-code",
+    "japan"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "adm-zip": "^0.5.10",
+    "commander": "^11.1.0",
+    "iconv-lite": "^0.6.3",
+    "node-fetch": "^2.7.0"
+  }
+}
