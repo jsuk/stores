@@ -7,6 +7,7 @@ const fetch = require('node-fetch');
 const AdmZip = require('adm-zip');
 const iconv = require('iconv-lite');
 const wellknown = require('wellknown');
+const h3 = require('h3-js');
 
 // Configuration
 const API_BASE_URL = process.env.RAKUTEN_API_URL || 'https://gateway-api.global.rakuten.com/mmeu/api/v3';
@@ -92,7 +93,7 @@ async function geocodePostalCode(postalCode, postalInfo) {
 
     const [lon, lat] = calculateCentroid(geojson);
     console.log(`Geocoded to Lat: ${lat}, Lng: ${lon}`);
-    return { latitude: lat, longitude: lon };
+    return { latitude: lat, longitude: lon, geojson: geojson };
 
   } catch (error) {
     console.error('Error geocoding with SPARQL:', error.message);
@@ -142,6 +143,40 @@ function calculateCentroid(geojson) {
     return [x / coords.length, y / coords.length];
   }
   return [0, 0];
+}
+
+/**
+ * Generates an array of hexagon centroids (latitude, longitude) that cover a given GeoJSON polygon.
+ * @param {object} geojson - The GeoJSON polygon object.
+ * @param {number} h3Resolution - The H3 resolution level.
+ * @returns {Array<[number, number]>} An array of [latitude, longitude] pairs for hexagon centroids.
+ */
+function generateHexagonCentroids(geojson, h3Resolution) {
+  if (!geojson || (geojson.type !== 'Polygon' && geojson.type !== 'MultiPolygon')) {
+    console.warn('Invalid GeoJSON polygon provided to generateHexagonCentroids.');
+    return [];
+  }
+
+  // h3.polyfill expects GeoJSON polygon coordinates in [lat, lng] format,
+  // but GeoJSON standard uses [lng, lat]. So we need to reverse them for h3.
+  const geojsonH3Format = JSON.parse(JSON.stringify(geojson)); // Deep copy to avoid modifying original
+  
+  if (geojsonH3Format.type === 'Polygon') {
+    geojsonH3Format.coordinates = geojsonH3Format.coordinates.map(ring => ring.map(([lng, lat]) => [lat, lng]));
+  } else if (geojsonH3Format.type === 'MultiPolygon') {
+    geojsonH3Format.coordinates = geojsonH3Format.coordinates.map(polygon => 
+      polygon.map(ring => ring.map(([lng, lat]) => [lat, lng]))
+    );
+  }
+
+  const hexIndexes = h3.polyfill(geojsonH3Format.coordinates, h3Resolution, true); // `true` for `geoJson`
+  
+  const centroids = hexIndexes.map(h3Index => {
+    const [lat, lng] = h3.h3ToGeo(h3Index);
+    return { latitude: lat, longitude: lng };
+  });
+
+  return centroids;
 }
 
 // Store exclusion list (same as in stores.html)
@@ -254,8 +289,29 @@ async function getAllStores(options = {}) {
     return stores;
   }
 
-  // Fetch from API
-  let stores = await fetchStoresFromAPI(options.centerLat, options.centerLng);
+  let allFetchedStores = [];
+  const pointsToFetch = options.centerPoints && options.centerPoints.length > 0
+    ? options.centerPoints
+    : [{ latitude: options.centerLat, longitude: options.centerLng }];
+
+  console.log(`Fetching stores from API for ${pointsToFetch.length} location(s)...`);
+
+  for (const point of pointsToFetch) {
+    const stores = await fetchStoresFromAPI(point.latitude, point.longitude);
+    if (stores && stores.length > 0) {
+      allFetchedStores = allFetchedStores.concat(stores);
+    }
+  }
+
+  // Deduplicate stores by map_store_id
+  const uniqueStoresMap = new Map();
+  for (const store of allFetchedStores) {
+    if (store.map_store_id) {
+      uniqueStoresMap.set(store.map_store_id, store);
+    }
+  }
+  let stores = Array.from(uniqueStoresMap.values());
+
   stores = filterRpayStores(stores);
   stores = filterExcludedStores(stores);
 
@@ -520,6 +576,7 @@ async function main() {
     .option('-c, --cache', 'Enable caching for API calls (default: disabled)')
     .option('--center-lat <latitude>', 'Center latitude for store search', parseFloat)
     .option('--center-lng <longitude>', 'Center longitude for store search', parseFloat)
+    .option('--h3-resolution <resolution>', 'H3 resolution level for hexagonal tessellation (default: 8)', parseInt, 8)
     .option('--no-optimize', 'Skip route optimization (use store order as-is)')
     .action(async (postalCode, options) => {
       try {
@@ -552,6 +609,19 @@ async function main() {
           if (geocodeResult) {
             centerLat = geocodeResult.latitude;
             centerLng = geocodeResult.longitude;
+            const areaGeojson = geocodeResult.geojson;
+
+            // Generate hexagon centroids if geojson is available and h3-resolution is specified
+            if (areaGeojson && options.h3Resolution !== undefined) {
+              console.log(`\nGenerating hexagon centroids with H3 resolution ${options.h3Resolution}...`);
+              const hexagonCentroids = generateHexagonCentroids(areaGeojson, options.h3Resolution);
+              if (hexagonCentroids.length > 0) {
+                console.log(`Generated ${hexagonCentroids.length} hexagon centroids.`);
+                options.centerPoints = hexagonCentroids; // New property to pass to getAllStores
+              } else {
+                console.warn('No hexagon centroids generated. Falling back to single centroid.');
+              }
+            }
           } else {
             console.warn('Geocoding failed, using default center coordinates for store search.');
           }
@@ -562,7 +632,8 @@ async function main() {
         const allStores = await getAllStores({
           noCache: !options.cache, // Now !options.cache correctly means "disable caching" if --cache is absent
           centerLat: centerLat,
-          centerLng: centerLng
+          centerLng: centerLng,
+          centerPoints: options.centerPoints // Pass the array of centroids
         });
 
         // Filter by postal code
