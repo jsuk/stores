@@ -2,12 +2,22 @@
 
 const fs = require('fs').promises;
 const path = require('path');
+const zlib = require('zlib');
+const { promisify } = require('util');
 const { Command } = require('commander');
 const fetch = require('node-fetch');
 const AdmZip = require('adm-zip');
 const iconv = require('iconv-lite');
 const wellknown = require('wellknown');
-const h3 = require('h3-js');
+const gdal = require('gdal-async');
+
+const gzip = promisify(zlib.gzip);
+const gunzip = promisify(zlib.gunzip);
+
+const roundCoordinate = (coord, precision = 7) => {
+  return parseFloat(coord.toFixed(precision));
+};
+
 
 // Configuration
 const API_BASE_URL = process.env.RAKUTEN_API_URL || 'https://gateway-api.global.rakuten.com/mmeu/api/v3';
@@ -53,6 +63,7 @@ async function geocodePostalCode(postalCode, postalInfo) {
   `;
 
   try {
+    console.log('Executing SPARQL Query:', findGeomEntityQuery);
     const geomResponse = await fetch(sparqlEndpoint, {
       method: 'POST',
       headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'Accept': 'application/sparql-results+json' },
@@ -102,6 +113,149 @@ async function geocodePostalCode(postalCode, postalInfo) {
 }
 
 /**
+ * Geocode area code using e-stat.go.jp SPARQL endpoint
+ * @param {string} areaCode - Japanese area code (5 digits for municipality, 9-12 for smaller areas)
+ * @returns {Object|null} Geocoding result with latitude, longitude, and geojson
+ */
+async function geocodeAreaCode(areaCode) {
+  console.log(`Geocoding area code: ${areaCode}`);
+
+  const sparqlEndpoint = 'https://data.e-stat.go.jp/lod/sparql/alldata/query';
+
+  // Normalize the area code (remove any prefixes or formatting)
+  const normalized = areaCode.replace(/[^0-9]/g, '');
+
+  // Determine query based on code length
+  let query;
+
+  if (normalized.length === 5) {
+    // Municipality code (prefecture 2 digits + municipality 3 digits)
+    // Query for municipality-level geometry using Standard Area Code System (SACS)
+    query = `
+      PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+      PREFIX ic: <http://imi.go.jp/ns/core/rdf#>
+      PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+      PREFIX dcterms: <http://purl.org/dc/terms/>
+      PREFIX sacs: <http://data.e-stat.go.jp/lod/terms/sacs#>
+      PREFIX administrativeArea: <http://data.e-stat.go.jp/lod/ontology/administrativeArea/>
+      PREFIX cd-dimension: <http://data.e-stat.go.jp/lod/ontology/crossDomain/dimension/>
+
+      SELECT DISTINCT ?label ?geom
+      WHERE {
+        {
+          # Try Standard Area Code System first
+          ?codeValue dcterms:identifier ?id filter(regex(?id,"^${normalized}")) .
+	  ?codeValue rdf:type <http://data.e-stat.go.jp/lod/terms/smallArea/SmallAreaCode>.
+          ?codeValue rdfs:label ?label .
+          ?codeValue geo:hasGeometry/geo:asWKT ?geom .
+          FILTER(LANG(?label) = "ja")
+        } UNION {
+          # Fallback to administrative area query
+          ?area a administrativeArea:AdministrativeArea ;
+                cd-dimension:standardAreaCode ?code ;
+                rdfs:label ?label ;
+                geo:hasGeometry/geo:asWKT ?geom .
+          FILTER(STR(?code) = "${normalized}")
+          FILTER(LANG(?label) = "ja")
+        }
+      }
+    `;
+  } else if (normalized.length >= 9 && normalized.length <= 12) {
+    // Small area code (9 digits), basic unit area (11 digits), or smaller (12 digits)
+    // Query using Standard Area Code System with hierarchical structure
+    query = `
+      PREFIX geo: <http://www.opengis.net/ont/geosparql#>
+      PREFIX ic: <http://imi.go.jp/ns/core/rdf#>
+      PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+      PREFIX dcterms: <http://purl.org/dc/terms/>
+      PREFIX sacs: <http://data.e-stat.go.jp/lod/terms/sacs#>
+
+      SELECT DISTINCT ?label ?geom
+      WHERE {
+        {
+          # Try to find the area code with hierarchical structure
+          ?codeValue <http://purl.org/dc/terms/identifier> ?codeStr .
+          FILTER(CONTAINS(?codeStr, "${normalized}"))
+          ?plainCode sacs:latestCode ?codeValue .
+          ?codeValue rdfs:label ?label .
+          ?codeValue geo:hasGeometry/geo:asWKT ?geom .
+          FILTER(LANG(?label) = "ja")
+          FILTER NOT EXISTS { ?codeValue sacs:succeedingCode ?x }
+        } UNION {
+          # Fallback: try as a direct identifier
+          ?area <http://purl.org/dc/terms/identifier> "${normalized}" .
+          ?area rdfs:label ?label .
+          ?area geo:hasGeometry/geo:asWKT ?geom .
+          FILTER(LANG(?label) = "ja")
+        }
+      }
+    `;
+  } else {
+    console.error(`Invalid area code length: ${normalized.length}. Expected 5, 9, 11, or 12 digits.`);
+    return null;
+  }
+
+  try {
+    console.log('Executing SPARQL Query:', query);
+    const response = await fetch(sparqlEndpoint, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Accept': 'application/sparql-results+json'
+      },
+      body: new URLSearchParams({ query })
+    });
+
+    if (!response.ok) {
+      throw new Error(`SPARQL query failed: ${response.statusText}`);
+    }
+
+    const data = await response.json();
+    console.log("SPARQL Area Code Data Bindings:", JSON.stringify(data.results.bindings, null, 2));
+
+    if (!data.results || !data.results.bindings || data.results.bindings.length === 0) {
+      console.warn(`No geometry found for area code: ${areaCode}`);
+      return []; // Return empty array
+    }
+
+    const results = data.results.bindings.map(binding => {
+      // Assuming 'geom' and 'label' are present and lowercase as per typical SPARQL JSON results
+      // Checking for existence of binding.geom and binding.label for robustness
+      if (!binding.GEOM || !binding.GEOM.value || !binding.LABEL) {
+        console.warn(`Skipping binding due to missing geometry or label: ${JSON.stringify(binding)}`);
+        return null;
+      }
+
+      const rawWkt = binding.GEOM.value;
+      const label = binding.LABEL.value;
+
+      const wktMatch = rawWkt.match(/(POINT|POLYGON|MULTIPOLYGON)\s*\(.*\)/);
+      if (!wktMatch) {
+        console.warn(`Could not extract WKT from: ${rawWkt}`);
+        return null;
+      }
+      const wkt = wktMatch[0];
+      const geojson = wellknown.parse(wkt);
+      const [lon, lat] = calculateCentroid(geojson);
+
+      return {
+        latitude: lat,
+        longitude: lon,
+        geojson: geojson,
+        label: label
+      };
+    }).filter(Boolean); // Filter out null results from map
+
+    console.log(`Found ${results.length} geometries for area code: ${areaCode}`);
+    return results;
+
+  } catch (error) {
+    console.error('Error geocoding area code with SPARQL:', error.message);
+    return null;
+  }
+}
+
+/**
  * Calculate centroid of a GeoJSON polygon.
  * This is a simple approximation.
  */
@@ -146,38 +300,181 @@ function calculateCentroid(geojson) {
 }
 
 /**
- * Generates an array of hexagon centroids (latitude, longitude) that cover a given GeoJSON polygon.
- * @param {object} geojson - The GeoJSON polygon object.
- * @param {number} h3Resolution - The H3 resolution level.
- * @returns {Array<[number, number]>} An array of [latitude, longitude] pairs for hexagon centroids.
+ * Generate tessellated hexagon polygons covering a GeoJSON polygon using GDAL
+ * @param {Object} geojson - GeoJSON polygon or multipolygon
+ * @param {number} resolution - H3 resolution level (7-11), converted to hexagon size
+ * @returns {Array} Array of hexagon geometries as GeoJSON polygons
  */
-function generateHexagonCentroids(geojson, h3Resolution) {
-  if (!geojson || (geojson.type !== 'Polygon' && geojson.type !== 'MultiPolygon')) {
-    console.warn('Invalid GeoJSON polygon provided to generateHexagonCentroids.');
+function generateHexagonPolygons(geojson, resolution = 8) {
+  try {
+    // Map H3 resolution to approximate hexagon edge length in degrees
+    const resolutionToSize = {
+      7: 0.011,    // ~1.22 km
+      8: 0.0041,   // ~0.46 km
+      9: 0.0015,   // ~0.17 km
+      10: 0.00058, // ~0.065 km
+      11: 0.00022  // ~0.025 km
+    };
+
+    const hexSize = resolutionToSize[resolution] || resolutionToSize[8];
+
+    // Convert GeoJSON to WKT
+    const wkt = wellknown.stringify(geojson);
+
+    // Create GDAL geometry from WKT
+    const polygon = gdal.Geometry.fromWKT(wkt);
+
+    // Get the envelope (bounding box) of the polygon
+    const envelope = polygon.getEnvelope();
+    const { minX, maxX, minY, maxY } = envelope;
+
+    // Calculate hexagon dimensions for flat-top hexagons
+    const hexWidth = Math.sqrt(3) * hexSize;
+    const hexHeight = 2 * hexSize;
+
+    const hexagons = [];
+
+    // Generate hexagonal grid (flat-top)
+    let row = 0;
+    for (let y = minY; y <= maxY + hexHeight / 2; y += hexHeight * 0.75, row++) {
+      const offsetX = (row % 2) * hexWidth / 2;
+
+      for (let x = minX; x <= maxX + hexWidth / 2; x += hexWidth) {
+        const centerX = x + offsetX;
+        const centerY = y;
+
+        // Create hexagon geometry
+        const hexCoords = [];
+        const precision = 7;
+        for (let i = 0; i < 6; i++) {
+          const angle = Math.PI / 3 * i + Math.PI / 6; // Start at 30 degrees for flat top
+          const vx = roundCoordinate(centerX + hexSize * Math.cos(angle), precision);
+          const vy = roundCoordinate(centerY + hexSize * Math.sin(angle), precision);
+          hexCoords.push([vx, vy]);
+        }
+        hexCoords.push(hexCoords[0]); // Close the ring
+
+        // Create polygon from coordinates
+        const hexRing = new gdal.LinearRing();
+        hexCoords.forEach(([hx, hy]) => hexRing.points.add(hx, hy));
+
+        const hexPolygon = new gdal.Polygon();
+        hexPolygon.rings.add(hexRing);
+
+        // Check if hexagon intersects with the original polygon
+        if (hexPolygon.intersects(polygon)) {
+          // Get the intersection to verify it's meaningful (not just touching)
+          const intersection = hexPolygon.intersection(polygon);
+          if (intersection && intersection.getArea() > 0) {
+            // Convert hexagon to GeoJSON
+            const hexWkt = hexPolygon.toWKT();
+            const hexGeoJSON = wellknown.parse(hexWkt);
+
+            hexagons.push({
+              geometry: hexGeoJSON,
+              center: { latitude: centerY, longitude: centerX }
+            });
+          }
+        }
+      }
+    }
+
+    console.log(`Generated ${hexagons.length} hexagon polygons covering the area`);
+    return hexagons;
+
+  } catch (error) {
+    console.error('Error generating hexagon polygons with GDAL:', error.message);
     return [];
   }
-
-  // h3.polyfill expects GeoJSON polygon coordinates in [lat, lng] format,
-  // but GeoJSON standard uses [lng, lat]. So we need to reverse them for h3.
-  const geojsonH3Format = JSON.parse(JSON.stringify(geojson)); // Deep copy to avoid modifying original
-  
-  if (geojsonH3Format.type === 'Polygon') {
-    geojsonH3Format.coordinates = geojsonH3Format.coordinates.map(ring => ring.map(([lng, lat]) => [lat, lng]));
-  } else if (geojsonH3Format.type === 'MultiPolygon') {
-    geojsonH3Format.coordinates = geojsonH3Format.coordinates.map(polygon => 
-      polygon.map(ring => ring.map(([lng, lat]) => [lat, lng]))
-    );
-  }
-
-  const hexIndexes = h3.polyfill(geojsonH3Format.coordinates, h3Resolution, true); // `true` for `geoJson`
-  
-  const centroids = hexIndexes.map(h3Index => {
-    const [lat, lng] = h3.h3ToGeo(h3Index);
-    return { latitude: lat, longitude: lng };
-  });
-
-  return centroids;
 }
+
+/**
+ * Generate hexagon centroids from a GeoJSON polygon using GDAL
+ * @param {Object} geojson - GeoJSON polygon or multipolygon
+ * @param {number} resolution - H3 resolution level (7-11), converted to hexagon size
+ * @returns {Array} Array of {latitude, longitude} objects representing hexagon centroids
+ */
+function generateHexagonCentroids(geojson, resolution = 8) {
+  try {
+    // Map H3 resolution to approximate hexagon edge length in degrees
+    // H3 resolutions and their approximate edge lengths:
+    // 7: ~1.22 km, 8: ~0.46 km, 9: ~0.17 km, 10: ~0.065 km, 11: ~0.025 km
+    const resolutionToSize = {
+      7: 0.011,  // ~1.22 km
+      8: 0.0041, // ~0.46 km
+      9: 0.0015, // ~0.17 km
+      10: 0.00058, // ~0.065 km
+      11: 0.00022  // ~0.025 km
+    };
+
+    const hexSize = resolutionToSize[resolution] || resolutionToSize[8];
+
+    // Convert GeoJSON to WKT
+    const wkt = wellknown.stringify(geojson);
+
+    // Create GDAL geometry from WKT
+    const polygon = gdal.Geometry.fromWKT(wkt);
+
+    // Get the envelope (bounding box) of the polygon
+    const envelope = polygon.getEnvelope();
+    const { minX, maxX, minY, maxY } = envelope;
+
+    // Calculate hexagon dimensions for flat-top hexagons
+    const hexWidth = Math.sqrt(3) * hexSize;
+    const hexHeight = 2 * hexSize;
+
+    const centroids = [];
+
+    // Generate hexagonal grid (flat-top)
+    let row = 0;
+    for (let y = minY; y <= maxY + hexHeight / 2; y += hexHeight * 0.75, row++) {
+      const offsetX = (row % 2) * hexWidth / 2;
+
+      for (let x = minX; x <= maxX + hexWidth / 2; x += hexWidth) {
+        const centerX = x + offsetX;
+        const centerY = y;
+
+        // Create hexagon geometry
+        const hexCoords = [];
+        const precision = 7;
+        for (let i = 0; i < 6; i++) {
+          const angle = Math.PI / 3 * i + Math.PI / 6; // Start at 30 degrees for flat top
+          const vx = roundCoordinate(centerX + hexSize * Math.cos(angle), precision);
+          const vy = roundCoordinate(centerY + hexSize * Math.sin(angle), precision);
+          hexCoords.push([vx, vy]);
+        }
+        hexCoords.push(hexCoords[0]); // Close the ring
+
+        // Create polygon from coordinates
+        const hexRing = new gdal.LinearRing();
+        hexCoords.forEach(([hx, hy]) => hexRing.points.add(hx, hy));
+
+        const hexPolygon = new gdal.Polygon();
+        hexPolygon.rings.add(hexRing);
+
+        // Check if hexagon intersects with the original polygon
+        if (hexPolygon.intersects(polygon)) {
+          // Get the intersection to verify it's meaningful (not just touching)
+          const intersection = hexPolygon.intersection(polygon);
+          if (intersection && intersection.getArea() > 0) {
+            centroids.push({
+              latitude: centerY,
+              longitude: centerX
+            });
+          }
+        }
+      }
+    }
+
+    console.log(`Generated ${centroids.length} hexagon centroids covering the area`);
+    return centroids;
+
+  } catch (error) {
+    console.error('Error generating hexagon centroids with GDAL:', error.message);
+    return [];
+  }
+}
+
 
 // Store exclusion list (same as in stores.html)
 const EXCLUDE_STORE_NAMES_CONTAINING = [
@@ -195,6 +492,65 @@ async function ensureCacheDir() {
     await fs.mkdir(CACHE_DIR, { recursive: true });
   } catch (error) {
     if (error.code !== 'EEXIST') throw error;
+  }
+}
+
+/**
+ * Generate cache file path for a postal or area code
+ * @param {string} code - Postal code (7 digits) or area code (5, 9-12 digits)
+ * @returns {string} Path to cache file
+ */
+function getCacheFilePath(code) {
+  // Normalize the code (remove hyphens and spaces)
+  const normalized = code.replace(/[-\s]/g, '');
+
+  // Determine the type based on length
+  let cacheType;
+  if (normalized.length === 7) {
+    cacheType = 'postal';
+  } else if (normalized.length === 5 || (normalized.length >= 9 && normalized.length <= 12)) {
+    cacheType = 'area';
+  } else {
+    cacheType = 'other';
+  }
+
+  return path.join(CACHE_DIR, `${cacheType}_${normalized}.json.gz`);
+}
+
+/**
+ * Write compressed cache data
+ * @param {string} cachePath - Path to cache file
+ * @param {Object} data - Data to cache
+ */
+async function writeCacheCompressed(cachePath, data) {
+  try {
+    const jsonString = JSON.stringify(data);
+    const compressed = await gzip(jsonString);
+    await fs.writeFile(cachePath, compressed);
+    console.log(`Cached data compressed to ${cachePath} (${(compressed.length / 1024).toFixed(2)} KB)`);
+  } catch (error) {
+    console.error('Error writing compressed cache:', error.message);
+    throw error;
+  }
+}
+
+/**
+ * Read compressed cache data
+ * @param {string} cachePath - Path to cache file
+ * @returns {Object|null} Cached data or null if not found
+ */
+async function readCacheCompressed(cachePath) {
+  try {
+    const compressed = await fs.readFile(cachePath);
+    const decompressed = await gunzip(compressed);
+    const data = JSON.parse(decompressed.toString('utf8'));
+    console.log(`Loaded compressed cache from ${cachePath}`);
+    return data;
+  } catch (error) {
+    if (error.code !== 'ENOENT') {
+      console.error('Error reading compressed cache:', error.message);
+    }
+    return null;
   }
 }
 
@@ -275,18 +631,36 @@ function filterRpayStores(stores) {
 
 /**
  * Get all stores with details (cached or from API)
+ * @param {Object} options - Options object
+ * @param {boolean} options.noCache - Skip cache if true
+ * @param {number} options.centerLat - Center latitude
+ * @param {number} options.centerLng - Center longitude
+ * @param {Array} options.centerPoints - Array of center points
+ * @param {string} options.postalCode - Postal code (7 digits) for cache naming
+ * @param {string} options.areaCode - Area code (9-11 digits) for cache naming
  */
 async function getAllStores(options = {}) {
   await ensureCacheDir();
-  const cachePath = path.join(CACHE_DIR, 'stores_with_details.json');
+
+  // Determine cache file path based on postal code or area code
+  let cachePath;
+  if (options.postalCode) {
+    cachePath = getCacheFilePath(options.postalCode);
+  } else if (options.areaCode) {
+    cachePath = getCacheFilePath(options.areaCode);
+  } else {
+    // Fallback to old cache name if no code provided
+    cachePath = path.join(CACHE_DIR, 'stores_all.json.gz');
+  }
 
   // Check cache first
   if (!options.noCache && await isCacheValid(cachePath)) {
-    console.log('Loading stores from cache...');
-    const data = await fs.readFile(cachePath, 'utf8');
-    const stores = JSON.parse(data);
-    console.log(`Loaded ${stores.length} stores from cache`);
-    return stores;
+    console.log('Loading stores from compressed cache...');
+    const stores = await readCacheCompressed(cachePath);
+    if (stores) {
+      console.log(`Loaded ${stores.length} stores from cache`);
+      return stores;
+    }
   }
 
   let allFetchedStores = [];
@@ -336,9 +710,9 @@ async function getAllStores(options = {}) {
     console.log(`Progress: ${Math.min(i + batchSize, stores.length)}/${stores.length}`);
   }
 
-  // Save to cache
-  await fs.writeFile(cachePath, JSON.stringify(storesWithDetails, null, 2));
-  console.log(`Cached ${storesWithDetails.length} stores`);
+  // Save to compressed cache
+  await writeCacheCompressed(cachePath, storesWithDetails);
+  console.log(`Cached ${storesWithDetails.length} stores in compressed format`);
 
   return storesWithDetails;
 }
@@ -410,6 +784,33 @@ function filterStoresByPostalCode(stores, postalCode) {
 }
 
 /**
+ * Filter stores by whether they are inside a GeoJSON polygon
+ * @param {Array} stores - Array of store objects
+ * @param {Object} geojson - GeoJSON polygon or multipolygon
+ * @returns {Array} Filtered array of stores
+ */
+function filterStoresByGeoJSON(stores, geojson) {
+  if (!geojson) return [];
+
+  try {
+    const wkt = wellknown.stringify(geojson);
+    const polygon = gdal.Geometry.fromWKT(wkt);
+
+    return stores.filter(store => {
+      if (typeof store.latitude !== 'number' || typeof store.longitude !== 'number') {
+        return false;
+      }
+
+      const point = new gdal.Point(store.longitude, store.latitude);
+      return polygon.contains(point);
+    });
+  } catch (error) {
+    console.error('Error filtering stores by GeoJSON:', error.message);
+    return [];
+  }
+}
+
+/**
  * Calculate distance between two points using Haversine formula
  */
 function calculateDistance(lat1, lon1, lat2, lon2) {
@@ -464,29 +865,48 @@ function orderStoresNearestNeighbor(stores, startLat, startLng) {
 }
 
 /**
- * Generate KML file from ordered stores
+ * Escape special XML characters in a string.
  */
-function generateKML(orderedStores, postalCode, postalInfo) {
-  const escapeTags = (str) => {
-    if (!str) return '';
-    return str.replace(/&/g, '&amp;')
-              .replace(/</g, '&lt;')
-              .replace(/>/g, '&gt;')
-              .replace(/"/g, '&quot;')
-              .replace(/'/g, '&apos;');
-  };
+const escapeTags = (str) => {
+  if (!str) return '';
+  return String(str).replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&apos;');
+};
+
+/**
+ * Generate KML file from ordered stores
+ * @param {Array} orderedStores - Array of store objects, ordered for the route
+ * @param {Object} options - Options for KML generation
+ * @param {string} [options.postalCode] - Postal code for the route
+ * @param {Object} [options.postalInfo] - Information about the postal code
+ * @param {string} [options.areaCode] - Area code for the route
+ * @param {string} [options.areaLabel] - Label for the area
+ * @param {Array} [options.hexagons] - Array of hexagon polygon geometries to overlay
+ * @returns {string} KML content
+ */
+function generateKML(orderedStores, options = {}) {
+  const { postalCode, postalInfo, areaCode, areaLabel, hexagons } = options;
 
   let kml = '<?xml version="1.0" encoding="UTF-8"?>\n';
   kml += '<kml xmlns="http://www.opengis.net/kml/2.2">\n';
   kml += '<Document>\n';
-  kml += `  <name>Rpay Stores Route - ${escapeTags(postalCode)}</name>\n`;
 
-  if (postalInfo && postalInfo.length > 0) {
-    const info = postalInfo[0];
-    kml += `  <description>Route for postal code ${escapeTags(postalCode)} (${escapeTags(info.prefecture)} ${escapeTags(info.city)} ${escapeTags(info.address)})</description>\n`;
-  } else {
-    kml += `  <description>Route for postal code ${escapeTags(postalCode)}</description>\n`;
+  if (postalCode) {
+    kml += `  <name>Rpay Stores Route - ${escapeTags(postalCode)}</name>\n`;
+    if (postalInfo && postalInfo.length > 0) {
+      const info = postalInfo[0];
+      kml += `  <description>Route for postal code ${escapeTags(postalCode)} (${escapeTags(info.prefecture)} ${escapeTags(info.city)} ${escapeTags(info.address)})</description>\n`;
+    } else {
+      kml += `  <description>Route for postal code ${escapeTags(postalCode)}</description>\n`;
+    }
+  } else if (areaCode) {
+    kml += `  <name>Rpay Stores in Area - ${escapeTags(areaLabel || areaCode)}</name>\n`;
+    kml += `  <description>Stores within area code ${escapeTags(areaCode)} (${escapeTags(areaLabel || '')})</description>\n`;
   }
+
 
   // Define styles
   kml += '  <Style id="startPoint">\n';
@@ -514,6 +934,54 @@ function generateKML(orderedStores, postalCode, postalInfo) {
   kml += '      <width>3</width>\n';
   kml += '    </LineStyle>\n';
   kml += '  </Style>\n';
+
+  kml += '  <Style id="hexagonStyle">\n';
+  kml += '    <LineStyle>\n';
+  kml += '      <color>ff00aaff</color>\n'; // Orange outline
+  kml += '      <width>2</width>\n';
+  kml += '    </LineStyle>\n';
+  kml += '    <PolyStyle>\n';
+  kml += '      <color>3300aaff</color>\n'; // Semi-transparent orange fill (33 = ~20% opacity)
+  kml += '    </PolyStyle>\n';
+  kml += '  </Style>\n';
+
+  // Add hexagon tessellation overlay if provided
+  if (hexagons && hexagons.length > 0) {
+    kml += '  <Folder>\n';
+    kml += '    <name>Hexagon Tessellation</name>\n';
+    kml += '    <description>Hexagonal grid covering the area</description>\n';
+
+    hexagons.forEach((hex, index) => {
+      const { geometry } = hex;
+
+      // Convert GeoJSON coordinates to KML format
+      let coordinates = '';
+      if (geometry.type === 'Polygon') {
+        const ring = geometry.coordinates[0];
+        ring.forEach(([lon, lat]) => {
+          coordinates += `${lon},${lat},0 `;
+        });
+      }
+
+      if (coordinates) {
+        kml += '    <Placemark>\n';
+        kml += `      <name>Hexagon ${index + 1}</name>\n`;
+        kml += '      <styleUrl>#hexagonStyle</styleUrl>\n';
+        kml += '      <Polygon>\n';
+        kml += '        <outerBoundaryIs>\n';
+        kml += '          <LinearRing>\n';
+        kml += '            <coordinates>\n';
+        kml += `              ${coordinates.trim()}\n`;
+        kml += '            </coordinates>\n';
+        kml += '          </LinearRing>\n';
+        kml += '        </outerBoundaryIs>\n';
+        kml += '      </Polygon>\n';
+        kml += '    </Placemark>\n';
+      }
+    });
+
+    kml += '  </Folder>\n';
+  }
 
   // Add placemarks for each store
   orderedStores.forEach((store, index) => {
@@ -561,107 +1029,287 @@ function generateKML(orderedStores, postalCode, postalInfo) {
   return kml;
 }
 
-/**
- * Main CLI function
- */
 async function main() {
   const program = new Command();
 
   program
     .name('kml-generator')
-    .description('Generate KML files for rpay stores based on Japanese postal codes')
-    .version('1.0.0')
-    .argument('<postal-code>', 'Japanese postal code (e.g., 100-0001 or 1000001)')
+    .description('Generate KML files for rpay stores based on Japanese postal codes or area codes')
+    .version('1.3.0')
+    .argument('<code>', 'Japanese postal code (7 digits, e.g., 100-0001) or area code (5/9/11/12 digits, e.g., 13101, 131010001)')
     .option('-o, --output <file>', 'Output KML file path')
+    .option('--geojson-output <file>', 'Output GeoJSON file path for hexagons')
+    .option('--area-geojson-output <file>', 'Output GeoJSON file path for the geocoded area geometry')
+    .option('--geojson-only', 'Only generate GeoJSON files, skip store fetching and KML generation')
     .option('-c, --cache', 'Enable caching for API calls (default: disabled)')
-    .option('--center-lat <latitude>', 'Center latitude for store search', parseFloat)
-    .option('--center-lng <longitude>', 'Center longitude for store search', parseFloat)
-    .option('--h3-resolution <resolution>', 'H3 resolution level for hexagonal tessellation (default: 8)', parseInt, 8)
-    .option('--no-optimize', 'Skip route optimization (use store order as-is)')
-    .action(async (postalCode, options) => {
+    .option('--center-lat <latitude>', 'Override center latitude for store search', parseFloat)
+    .option('--center-lng <longitude>', 'Override center longitude for store search', parseFloat)
+    .option('--h3-resolution <resolution>', 'Hexagonal tessellation resolution level 7-11 (default: 8, ~460m hexagons)', parseInt, 8)
+    .option('--no-hexagons', 'Disable hexagonal tessellation overlay in KML output')
+    .option('--no-optimize', 'Skip route optimization (for postal codes)')
+    .action(async (code, options) => {
       try {
         console.log(`\n🗾 Rpay Store KML Generator`);
         console.log(`=====================================\n`);
 
-        // Normalize postal code
-        const normalizedPostalCode = postalCode.replace(/-/g, '');
+        const normalizedCode = code.replace(/[-\s]/g, '');
+        const isPostalCode = normalizedCode.length === 7;
+        const isAreaCode = [5, 9, 11].includes(normalizedCode.length);
 
-        // Load postal data
-        console.log('📍 Loading postal code data...');
-        const postalData = await loadPostalData();
-        const postalInfo = postalData[normalizedPostalCode];
+        let orderedStores = [];
+        let kml;
+        let outputPath;
+        let hexagonPolygons = []; // Store hexagon polygons for visualization
 
-        if (postalInfo && postalInfo.length > 0) {
-          const info = postalInfo[0];
-          console.log(`   Postal Code: ${normalizedPostalCode}`);
-          console.log(`   Address: ${info.prefecture} ${info.city} ${info.address}`);
-        } else {
-          console.log(`   Warning: Postal code ${normalizedPostalCode} not found in database`);
-        }
+        if (isAreaCode) {
+          // --- Area Code Logic ---
+          console.log(`Processing as Area Code: ${code}`);
 
-        // Determine center coordinates for store search
-        let centerLat = options.centerLat;
-        let centerLng = options.centerLng;
+          if (!options.geojsonOutput) {
+            options.geojsonOutput = `h${code}.geojson`;
+            console.log(`Defaulting --geojson-output to ${options.geojsonOutput}`);
+          }
+          if (!options.areaGeojsonOutput) {
+            options.areaGeojsonOutput = `a${code}.geojson`;
+            console.log(`Defaulting --area-geojson-output to ${options.areaGeojsonOutput}`);
+          }
 
-        if ((!centerLat || !centerLng) && postalInfo && postalInfo.length > 0) {
-          console.log(`\n🌍 Geocoding postal code ${normalizedPostalCode} to get center coordinates...`);
-          const geocodeResult = await geocodePostalCode(normalizedPostalCode, postalInfo);
-          if (geocodeResult) {
-            centerLat = geocodeResult.latitude;
-            centerLng = geocodeResult.longitude;
-            const areaGeojson = geocodeResult.geojson;
+          console.log(`\n🌍 Geocoding area code ${code}...`);
+          const geocodeResults = await geocodeAreaCode(code);
 
-            // Generate hexagon centroids if geojson is available and h3-resolution is specified
-            if (areaGeojson && options.h3Resolution !== undefined) {
-              console.log(`\nGenerating hexagon centroids with H3 resolution ${options.h3Resolution}...`);
-              const hexagonCentroids = generateHexagonCentroids(areaGeojson, options.h3Resolution);
-              if (hexagonCentroids.length > 0) {
-                console.log(`Generated ${hexagonCentroids.length} hexagon centroids.`);
-                options.centerPoints = hexagonCentroids; // New property to pass to getAllStores
-              } else {
-                console.warn('No hexagon centroids generated. Falling back to single centroid.');
+          if (!geocodeResults || geocodeResults.length === 0) {
+            console.error(`\n❌ Could not geocode area code ${code}.`);
+            process.exit(1);
+          }
+
+          // Combine all geojson results into one FeatureCollection for area output
+          const allGeometries = geocodeResults.map(r => r.geojson).filter(Boolean);
+          if (options.areaGeojsonOutput && allGeometries.length > 0) {
+            const featureCollection = {
+              type: 'FeatureCollection',
+              features: allGeometries.map((geom, index) => ({
+                type: 'Feature',
+                geometry: geom,
+                properties: { id: index, label: geocodeResults[index].label }
+              }))
+            };
+            console.log(`\n📄 Generating GeoJSON file for ${allGeometries.length} area geometries...`);
+            await fs.writeFile(options.areaGeojsonOutput, JSON.stringify(featureCollection, null, 2), 'utf8');
+            console.log(`\n✅ Area GeoJSON file generated successfully!`);
+            console.log(`   File: ${path.resolve(options.areaGeojsonOutput)}`);
+          }
+
+          let centerPoints = [];
+          
+          if (geocodeResults.length > 0 && !options.noHexagons) {
+            console.log(`\n🔷 Combining ${geocodeResults.length} geometries for tessellation...`);
+            
+            // Use GDAL to combine all geometries into a single MultiPolygon
+            const allGeometries = geocodeResults.map(r => r.geojson).filter(Boolean);
+            const gdalGeometries = allGeometries.map(geom => gdal.Geometry.fromGeoJson(geom));
+            
+            let combinedGeometry = null;
+            if (gdalGeometries.length > 0) {
+              combinedGeometry = gdalGeometries[0];
+              for (let i = 1; i < gdalGeometries.length; i++) {
+                combinedGeometry = combinedGeometry.union(gdalGeometries[i]);
               }
             }
-          } else {
-            console.warn('Geocoding failed, using default center coordinates for store search.');
+            
+            // Check if the combined geometry is valid and has an area
+            if (combinedGeometry && !combinedGeometry.isEmpty() && combinedGeometry.getArea() > 0) {
+              const combinedWkt = combinedGeometry.toWKT();
+              const combinedGeoJson = wellknown.parse(combinedWkt);
+
+              console.log(`\n🔷 Generating hexagon tessellation for combined geometry (resolution: ${options.h3Resolution})...`);
+              hexagonPolygons = generateHexagonPolygons(combinedGeoJson, options.h3Resolution);
+              
+              hexagonPolygons.forEach(h => {
+                const vertices = h.geometry.coordinates[0]; // Array of [lon, lat]
+                // The last vertex is a duplicate to close the polygon, so we skip it.
+                for (let i = 0; i < vertices.length - 1; i++) {
+                    const [lon, lat] = vertices[i];
+                    centerPoints.push({ latitude: lat, longitude: lon });
+                }
+              });
+            } else {
+                console.warn('Combined geometry is empty or invalid, skipping hexagon generation.');
+            }
           }
-        }
-        
-        // Get all stores
-        console.log('\n🏪 Fetching store data...');
-        const allStores = await getAllStores({
-          noCache: !options.cache, // Now !options.cache correctly means "disable caching" if --cache is absent
-          centerLat: centerLat,
-          centerLng: centerLng,
-          centerPoints: options.centerPoints // Pass the array of centroids
-        });
 
-        // Filter by postal code
-        console.log(`\n🔍 Filtering stores by postal code ${normalizedPostalCode}...`);
-        let filteredStores = filterStoresByPostalCode(allStores, normalizedPostalCode);
-        console.log(`   Found ${filteredStores.length} stores`);
+          // If no center points were generated at all from hexagons, use the centroid of the first geometry.
+          if (centerPoints.length === 0 && geocodeResults.length > 0) {
+            const { latitude, longitude } = geocodeResults[0];
+            centerPoints.push({ latitude, longitude });
+          }
 
-        if (filteredStores.length === 0) {
-          console.log('\n❌ No stores found for this postal code');
+          if (options.geojsonOutput && hexagonPolygons.length > 0) {
+            console.log(`\n📄 Generating GeoJSON file for hexagons...`);
+            const features = hexagonPolygons.map((hex, index) => ({
+              type: 'Feature',
+              geometry: hex.geometry,
+              properties: {
+                id: index,
+                center_lat: hex.center.latitude,
+                center_lon: hex.center.longitude
+              }
+            }));
+            const featureCollection = {
+              type: 'FeatureCollection',
+              features
+            };
+            await fs.writeFile(options.geojsonOutput, JSON.stringify(featureCollection, null, 2), 'utf8');
+            console.log(`\n✅ GeoJSON file generated successfully!`);
+            console.log(`   File: ${path.resolve(options.geojsonOutput)}`);
+          }
+
+          if (options.geojsonOnly) {
+              console.log('\n✅ GeoJSON generation complete. Exiting as requested.');
+              process.exit(0);
+          }
+          // If still no center points, and no geocode results, something is wrong, but handled by earlier exit.
+          // If centerPoints is still empty after this, need to ensure fetchStoresFromAPI can handle it.
+          // It already has default lat/lng.
+
+          console.log('\n🏪 Fetching store data...');
+          const allStores = await getAllStores({
+            noCache: !options.cache,
+            centerPoints,
+            areaCode: normalizedCode
+          });
+
+          console.log(`\n🔍 Filtering stores within the area geometries...`);
+          let filteredStores = [];
+          for (const result of geocodeResults) {
+              const storesInGeom = filterStoresByGeoJSON(allStores, result.geojson);
+              // Simple concat, might have duplicates if geometries overlap
+              filteredStores.push(...storesInGeom);
+          }
+          // Deduplicate stores
+          const uniqueStoreIds = new Set();
+          filteredStores = filteredStores.filter(store => {
+            if (uniqueStoreIds.has(store.map_store_id)) {
+              return false;
+            } else {
+              uniqueStoreIds.add(store.map_store_id);
+              return true;
+            }
+          });
+          console.log(`   Found ${filteredStores.length} unique stores.`);
+          
+          if (filteredStores.length === 0) {
+            console.log('\n❌ No stores found for this area code.');
+            process.exit(0);
+          }
+
+          // For area codes, we just list the stores, no route optimization by default
+          orderedStores = filteredStores.sort((a, b) => a.store_name.localeCompare(b.store_name));
+          
+          console.log('\n📄 Generating KML file...');
+          kml = generateKML(orderedStores, {
+            areaCode: code,
+            areaLabel: geocodeResults[0].label, // Use label from the first geometry
+            hexagons: options.noHexagons !== true ? hexagonPolygons : []
+          });
+          outputPath = options.output || `stores_in_area_${normalizedCode}.kml`;
+
+
+        } else if (isPostalCode) {
+          // --- Postal Code Logic ---
+          console.log(`Processing as Postal Code: ${code}`);
+          const postalData = await loadPostalData();
+          const postalInfo = postalData[normalizedCode];
+
+          if (postalInfo && postalInfo.length > 0) {
+            const info = postalInfo[0];
+            console.log(`   Address: ${info.prefecture} ${info.city} ${info.address}`);
+          } else {
+            console.warn(`   Warning: Postal code ${normalizedCode} not found in database.`);
+          }
+
+          let centerLat = options.centerLat;
+          let centerLng = options.centerLng;
+          let centerPoints = [];
+
+          if ((!centerLat || !centerLng) && postalInfo) {
+            console.log(`\n🌍 Geocoding postal code ${normalizedCode}...`);
+            const geocodeResult = await geocodePostalCode(normalizedCode, postalInfo);
+            if (geocodeResult) {
+              centerLat = geocodeResult.latitude;
+              centerLng = geocodeResult.longitude;
+              if (geocodeResult.geojson && options.h3Resolution) {
+                console.log(`\n🔷 Generating hexagon tessellation (resolution: ${options.h3Resolution})...`);
+                hexagonPolygons = generateHexagonPolygons(geocodeResult.geojson, options.h3Resolution);
+                centerPoints = hexagonPolygons.map(h => h.center);
+              }
+            }
+          }
+          
+          if (options.geojsonOutput && hexagonPolygons.length > 0) {
+            console.log(`\n📄 Generating GeoJSON file for hexagons...`);
+            const features = hexagonPolygons.map((hex, index) => ({
+              type: 'Feature',
+              geometry: hex.geometry,
+              properties: {
+                id: index,
+                center_lat: hex.center.latitude,
+                center_lon: hex.center.longitude
+              }
+            }));
+            const featureCollection = {
+              type: 'FeatureCollection',
+              features
+            };
+            await fs.writeFile(options.geojsonOutput, JSON.stringify(featureCollection, null, 2), 'utf8');
+            console.log(`\n✅ GeoJSON file generated successfully!`);
+            console.log(`   File: ${path.resolve(options.geojsonOutput)}`);
+          }
+
+          if (options.geojsonOnly) {
+              console.log('\n✅ GeoJSON generation complete. Exiting as requested.');
+              process.exit(0);
+          }
+
+          console.log('\n🏪 Fetching store data...');
+          const allStores = await getAllStores({
+            noCache: !options.cache,
+            centerLat,
+            centerLng,
+            centerPoints,
+            postalCode: normalizedCode
+          });
+
+          console.log(`\n🔍 Filtering stores by postal code ${normalizedCode}...`);
+          let filteredStores = filterStoresByPostalCode(allStores, normalizedCode);
+          console.log(`   Found ${filteredStores.length} stores.`);
+
+          if (filteredStores.length === 0) {
+            console.log('\n❌ No stores found for this postal code.');
+            process.exit(0);
+          }
+
+          if (options.noOptimize) {
+            orderedStores = filteredStores;
+            console.log('\n🚫 Route optimization skipped.');
+          } else {
+            console.log('\n🚀 Optimizing route...');
+            orderedStores = orderStoresNearestNeighbor(filteredStores, centerLat, centerLng);
+          }
+          
+          console.log('\n📄 Generating KML file...');
+          kml = generateKML(orderedStores, {
+            postalCode: code,
+            postalInfo,
+            hexagons: options.hexagons !== false ? hexagonPolygons : []
+          });
+          outputPath = options.output || `route_${normalizedCode}.kml`;
+
+        } else {
+          console.error(`\n❌ Invalid code format: "${code}"`);
+          console.error('Please provide a 5, 7, 9, 10, 11, or 12-digit area code.');
           process.exit(1);
         }
 
-        // Order stores
-        let orderedStores;
-        if (options.optimize !== false) {
-          console.log('\n🚀 Optimizing route using nearest neighbor algorithm...');
-          orderedStores = orderStoresNearestNeighbor(filteredStores);
-          console.log(`   Ordered ${orderedStores.length} stores`);
-        } else {
-          orderedStores = filteredStores;
-        }
-
-        // Generate KML
-        console.log('\n📄 Generating KML file...');
-        const kml = generateKML(orderedStores, normalizedPostalCode, postalInfo);
-
-        // Determine output path
-        const outputPath = options.output || `route_${normalizedPostalCode}.kml`;
         await fs.writeFile(outputPath, kml, 'utf8');
 
         console.log(`\n✅ KML file generated successfully!`);
@@ -669,13 +1317,13 @@ async function main() {
         console.log(`   Stores: ${orderedStores.length}`);
         console.log(`\n📋 Store list:`);
         orderedStores.forEach((store, idx) => {
-          console.log(`   ${idx + 1}. ${store.store_name}`);
+          console.log(`   ${idx + 1}. ${escapeTags(store.store_name)}`);
         });
 
         console.log(`\n💡 Import this KML file into Google Maps to view the route.\n`);
 
       } catch (error) {
-        console.error('\n❌ Error:', error.message);
+        console.error('\n❌ An unexpected error occurred:', error.message);
         if (process.env.DEBUG) {
           console.error(error.stack);
         }
@@ -699,5 +1347,9 @@ module.exports = {
   filterStoresByPostalCode,
   orderStoresNearestNeighbor,
   generateKML,
-  loadPostalData
+  loadPostalData,
+  generateHexagonPolygons,
+  generateHexagonCentroids,
+  geocodeAreaCode,
+  geocodePostalCode
 };
